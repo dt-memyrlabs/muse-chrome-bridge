@@ -10,6 +10,11 @@
  *       action it announces fires only after the user has seen it arrive.
  *   { op: "warm" } — the script is loaded; show nothing.
  *   { op: "hide" } — fade out. (null) removes the cursor at once.
+ *   { op: "hideForCapture" } / { op: "showAfterCapture" } — hide before a
+ *       screenshot and restore after it, so a capture never contains the
+ *       cursor (Claude in Chrome's HIDE_FOR_TOOL_USE / SHOW_AFTER_TOOL_USE).
+ *       A safety timer restores the cursor after 5 s if the show never
+ *       arrives, exactly as theirs does.
  * An idle cursor fades out on its own after a few seconds. */
 (() => {
   if (window.top !== window || window.__museBridgeCursor) return;
@@ -20,6 +25,7 @@
   let pos = null;             // last point shown {x, y}; null while never shown
   let idleTimer = null;
   let chain = Promise.resolve();
+  let capHidden = false, capWasShown = false, capTimer = null;
 
   function build() {
     host = document.createElement("muse-bridge-cursor");
@@ -47,6 +53,27 @@
     if (host) host.remove();
     host = null; cur = null; ring = null; pos = null;
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (capTimer) { clearTimeout(capTimer); capTimer = null; }
+    capHidden = false; capWasShown = false;
+  }
+
+  // Hide for a screenshot: remember whether the cursor was on screen,
+  // take it off, and restore it when told — or after 5 s on our own,
+  // so a lost "show" can never leave the cursor hidden for good.
+  function hideForCapture() {
+    if (capHidden) return;
+    capHidden = true;
+    capWasShown = !!(cur && cur.style.opacity === "1");
+    if (cur) cur.style.opacity = "0";
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    capTimer = setTimeout(showAfterCapture, 5000);
+  }
+  function showAfterCapture() {
+    if (capTimer) { clearTimeout(capTimer); capTimer = null; }
+    if (!capHidden) return;
+    capHidden = false;
+    if (capWasShown && cur) { cur.style.opacity = "1"; armIdle(); }
+    capWasShown = false;
   }
 
   function armIdle() {
@@ -110,6 +137,8 @@
       pos = null;
       return Promise.resolve(true);
     }
+    if (cmd.op === "hideForCapture") { hideForCapture(); return Promise.resolve(true); }
+    if (cmd.op === "showAfterCapture") { showAfterCapture(); return Promise.resolve(true); }
     if (cmd.op === "go" && Number.isFinite(cmd.x) && Number.isFinite(cmd.y)) {
       // Serialize: a glide asked for while one is running waits its turn,
       // so the cursor never teleports between two announced actions.
