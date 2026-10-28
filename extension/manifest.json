@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Muse Chrome Bridge",
-  "version": "2.4.1",
+  "version": "2.6.0",
   "description": "Give tabs to a Muse chat. That chat can work only in the tabs you give it, on sites you allow.",
   "background": {
     "service_worker": "sw.js"
@@ -20,6 +20,7 @@
     "sidePanel",
     "notifications",
     "debugger",
+    "webNavigation",
     "clipboardWrite",
     "nativeMessaging",
     "scripting"
