@@ -245,6 +245,20 @@ function renderRest(st) {
       for (const t of x.tabsList) tl.append(el("div", { class: "muted" }, "• " + (t.title || t.host) + (t.here === false ? " — another window" : "")));
       block.append(tl);
     }
+    // Orphaned tabs: opened from one of this chat's tabs but not
+    // shared. They are offered, never taken — Add runs the ordinary
+    // one-confirmation share.
+    if (Array.isArray(x.orphans) && x.orphans.length) {
+      const ol = el("div", { class: "sites" });
+      ol.append(el("div", { class: "muted" }, "Opened from this chat's tabs, not shared:"));
+      for (const o of x.orphans) {
+        const add = el("button", { class: "site-remove", onclick: () => { const r = send("add_tab", { sessionId: x.sessionId, tabId: o.tabId }); if (r && r.then) r.then(() => { lastJson = ""; refresh(); }); } }, "Add");
+        add.setAttribute("aria-label", "Add " + (o.title || o.host) + " to this chat");
+        add.title = "Add this tab (asks the one full-control confirmation)";
+        ol.append(el("div", { class: "site-row" }, el("span", { class: "site-name" }, o.title || o.host), add));
+      }
+      block.append(ol);
+    }
     if (sites.length) {
       const list = el("div", { class: "sites" });
       for (const host of sites) {
@@ -258,6 +272,9 @@ function renderRest(st) {
     }
     ch.append(block);
   }
+
+  renderHelpers(st);
+  renderSavedPrompts(st);
 
   // Log
   const lg = $("log"); lg.replaceChildren();
@@ -273,3 +290,170 @@ chrome.tabs.onUpdated.addListener((tabId, info, tab) => { if (myWindowId !== nul
 setInterval(() => refresh(), 1000); // countdowns; the page section redraws only when its data changes
 setInterval(() => { lastJson = ""; }, 30000); // the code's "expires in" minutes
 refresh();
+
+/* ------------------------------------------------------- helpers */
+// v2.8 (FULL-GAP §12): workflow recording, element picking, the
+// javascript_tool switch, and a debug export. Recording and picking
+// act on this window's current tab.
+function pickDescription(p) {
+  if (!p) return "";
+  return (p.tag || "element") + (p.id ? "#" + p.id : "") +
+    (p.text ? " '" + p.text + "'" : "") + " at (" + p.x + ", " + p.y + ")" + (p.url ? " — " + p.url : "");
+}
+function renderHelpers(st) {
+  const box = $("helpers");
+  if (!box) return;
+  box.replaceChildren();
+  const tabId = st.current && st.current.tabId;
+  const again = () => { lastJson = ""; refresh(); };
+  const rec = st.recording || { active: false };
+  if (rec.active) {
+    box.append(el("div", { class: "row" },
+      el("span", { class: "muted" }, "Recording your actions in the tab — " + rec.steps + " step" + (rec.steps === 1 ? "" : "s") + " so far."),
+      el("button", { onclick: () => send("wf_stop").then(again) }, "Stop & save")));
+  } else {
+    box.append(el("div", { class: "row" },
+      el("button", { disabled: !tabId, onclick: () => send("wf_start", { tabId }).then(again) }, "Record workflow"),
+      el("span", { class: "muted" }, "Records your clicks and field edits in this tab as a saved prompt. Typed values are not recorded.")));
+  }
+  if (st.picking) {
+    box.append(el("p", { class: "muted" }, "Click any element in the tab to pick it (Esc cancels)."));
+  } else {
+    box.append(el("div", { class: "row" },
+      el("button", { disabled: !tabId, onclick: () => send("pick_start", { tabId }).then(again) }, "Pick an element")));
+  }
+  if (st.lastPick) {
+    box.append(el("div", { class: "row" },
+      el("span", { class: "muted" }, "Picked: " + pickDescription(st.lastPick)),
+      el("button", { onclick: () => { const ta = $("promptText"); if (ta) { ta.value = (ta.value ? ta.value + "\n" : "") + "Element: " + pickDescription(st.lastPick); ta.focus(); } } }, "Use in a prompt")));
+  }
+  const jsRow = el("div", { class: "row" });
+  const jsBox = el("input", { type: "checkbox", checked: !!st.javascriptEnabled,
+    onchange: (e) => send("set_javascript_enabled", { enabled: !!e.target.checked }).then(again) });
+  jsRow.append(jsBox, el("span", { class: "muted" }, "Allow javascript_tool — runs code in shared pages. Off by default."));
+  box.append(jsRow);
+  box.append(el("div", { class: "row" },
+    el("button", { onclick: async () => {
+      const r = await send("debug_export");
+      if (!r || !r.ok) return;
+      const blob = new Blob([JSON.stringify(r.export, null, 2)], { type: "application/json" });
+      const a = el("a", { href: URL.createObjectURL(blob), download: "muse-bridge-debug.json" });
+      document.body.append(a); a.click(); a.remove();
+    } }, "Export debug info")));
+}
+
+/* Voice input for a textarea: webkitSpeechRecognition where Chrome
+ * offers it; the button simply does not appear where it does not. */
+function voiceButton(textarea) {
+  const SR = window.webkitSpeechRecognition || window.SpeechRecognition;
+  if (!SR) return null;
+  const btn = el("button", {}, "🎤 Dictate");
+  btn.addEventListener("click", () => {
+    const rec = new SR();
+    rec.lang = "en-US"; rec.interimResults = false;
+    btn.disabled = true; btn.textContent = "Listening…";
+    rec.onresult = (e) => {
+      const text = e.results && e.results[0] && e.results[0][0] && e.results[0][0].transcript;
+      if (text) textarea.value = (textarea.value ? textarea.value + " " : "") + text;
+    };
+    rec.onend = () => { btn.disabled = false; btn.textContent = "🎤 Dictate"; };
+    rec.onerror = rec.onend;
+    try { rec.start(); } catch (err) { btn.disabled = false; btn.textContent = "🎤 Dictate"; }
+  });
+  return btn;
+}
+
+/* Saved prompts (v2.8, FULL-GAP \u00a76): list, editor, schedules.
+ * A prompt's schedule is a one-shot alarm the worker re-arms; a run
+ * opens its own window and waits in the runs list with its pairing
+ * code. Editing a prompt's text means its next scheduled run asks
+ * the one full-control confirmation again. */
+let editingPromptId = null;
+function scheduleText(p) {
+  const t = p.specificTime || "09:00";
+  switch (p.repeatType) {
+    case "once": return "once" + (p.specificDate ? " on " + p.specificDate : "") + " at " + t;
+    case "daily": return "daily at " + t;
+    case "weekly": return "weekly on day " + (p.dayOfWeek != null ? p.dayOfWeek : 0) + " at " + t;
+    case "monthly": return "monthly on day " + (p.dayOfMonth != null ? p.dayOfMonth : 1) + " at " + t;
+    case "annually": return "annually on " + (p.monthAndDay || "01-01") + " at " + t;
+    default: return "no schedule";
+  }
+}
+function renderSavedPrompts(st) {
+  const box = $("savedPrompts");
+  if (!box) return;
+  box.replaceChildren();
+  const again = () => { lastJson = ""; refresh(); };
+  const list = Array.isArray(st.savedPrompts) ? st.savedPrompts : [];
+  if (!list.length) box.append(el("p", { class: "empty" }, "None yet. Save one below, or record a workflow."));
+  for (const p of list) {
+    const row = el("div", { class: "site-row" });
+    row.append(el("span", { class: "site-name" },
+      "/" + p.command + " \u2014 " + p.name + " \u00b7 " + scheduleText(p) +
+      (p.usageCount ? " \u00b7 used " + p.usageCount + "\u00d7" : "")));
+    row.append(el("button", { class: "site-remove", onclick: () => send("prompt_run_now", { id: p.id }).then(again) }, "Run"));
+    row.append(el("button", { class: "site-remove", onclick: () => { editingPromptId = p.id; fillPromptForm(p); } }, "Edit"));
+    row.append(el("button", { class: "site-remove", onclick: () => send("prompt_delete", { id: p.id }).then(again) }, "Delete"));
+    box.append(row);
+  }
+  // Runs awaiting a chat (or finished): the code + prompt text are
+  // the hand-off \u2014 paste both into the chat.
+  const runs = Array.isArray(st.promptRuns) ? st.promptRuns : [];
+  for (const r of runs) {
+    const p = list.find((x) => x.id === r.promptId);
+    const line = el("div", { class: "sites" });
+    line.append(el("div", { class: "muted" },
+      "Run \u00b7 " + r.name + " \u00b7 " + new Date(r.at).toLocaleString() + " \u00b7 " + r.status +
+      (r.code ? " \u00b7 code " + r.code : "")));
+    if (p && /^awaiting chat/.test(r.status)) {
+      line.append(el("button", { class: "link", onclick: () => copyText(p.prompt).then(() => {}) }, "Copy the prompt text"));
+    }
+    box.append(line);
+  }
+  // The editor.
+  const form = el("div", { class: "sites" });
+  form.append(el("div", { class: "muted" }, editingPromptId ? "Editing prompt:" : "New prompt:"));
+  const nameI = el("input", { type: "text", id: "promptName", placeholder: "Name" });
+  const cmdI = el("input", { type: "text", id: "promptCommand", placeholder: "/command (optional)" });
+  const urlI = el("input", { type: "text", id: "promptUrl", placeholder: "Start URL (optional)" });
+  const textI = el("textarea", { id: "promptText", rows: 5, placeholder: "The prompt text the chat will run" });
+  textI.style.cssText = "font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--fg);width:100%;";
+  const repS = el("select", { id: "promptRepeat" },
+    el("option", { value: "none" }, "No schedule"),
+    el("option", { value: "once" }, "Once"),
+    el("option", { value: "daily" }, "Daily"),
+    el("option", { value: "weekly" }, "Weekly"),
+    el("option", { value: "monthly" }, "Monthly"),
+    el("option", { value: "annually" }, "Annually"));
+  const timeI = el("input", { type: "time", id: "promptTime", value: "09:00" });
+  const dateI = el("input", { type: "date", id: "promptDate" });
+  const dowI = el("input", { type: "number", id: "promptDow", min: 0, max: 6, placeholder: "Day of week 0-6 (weekly)" });
+  const domI = el("input", { type: "number", id: "promptDom", min: 1, max: 31, placeholder: "Day of month (monthly)" });
+  const mdI = el("input", { type: "text", id: "promptMd", placeholder: "MM-DD (annually)" });
+  const err = el("p", { class: "muted", id: "promptError" });
+  const save = el("button", { class: "primary", onclick: async () => {
+    const body = { name: nameI.value, command: cmdI.value, url: urlI.value, prompt: textI.value,
+      repeatType: repS.value, specificTime: timeI.value || "09:00", specificDate: dateI.value || null,
+      dayOfWeek: dowI.value === "" ? null : Number(dowI.value), dayOfMonth: domI.value === "" ? null : Number(domI.value),
+      monthAndDay: mdI.value || null };
+    const r = editingPromptId ? await send("prompt_update", { id: editingPromptId, ...body })
+                               : await send("prompt_save", body);
+    if (r && r.ok) { editingPromptId = null; again(); }
+    else err.textContent = (r && (r.detail || r.error)) || "Could not save.";
+  } }, editingPromptId ? "Save changes" : "Save prompt");
+  const row = el("div", { class: "row" }, save);
+  const vb = voiceButton(textI);
+  if (vb) row.append(vb);
+  if (editingPromptId) row.append(el("button", { onclick: () => { editingPromptId = null; again(); } }, "Cancel edit"));
+  form.append(nameI, cmdI, urlI, textI, repS, timeI, dateI, dowI, domI, mdI, row, err);
+  box.append(form);
+}
+function fillPromptForm(p) {
+  const set = (id, v) => { const n = $(id); if (n && v != null) n.value = v; };
+  set("promptName", p.name); set("promptCommand", p.command); set("promptUrl", p.url || "");
+  set("promptText", p.prompt); set("promptRepeat", p.repeatType || "none");
+  set("promptTime", p.specificTime || "09:00"); set("promptDate", p.specificDate || "");
+  set("promptDow", p.dayOfWeek); set("promptDom", p.dayOfMonth); set("promptMd", p.monthAndDay || "");
+  const ta = $("promptText"); if (ta) ta.focus();
+}
