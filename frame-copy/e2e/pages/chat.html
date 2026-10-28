@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Frame Rig Chat</title>
+<style>
+  body { margin: 0; font-family: sans-serif; padding: 10px; }
+  #messages { border: 1px solid #999; min-height: 110px; padding: 6px; margin: 0 0 10px 0; }
+  #composer { border: 1px solid #333; min-height: 44px; padding: 6px; margin-bottom: 10px; }
+  #note-input { width: 420px; height: 48px; display: block; margin-bottom: 10px; }
+  #send-btn { padding: 6px 18px; }
+</style>
+</head>
+<body>
+  <h1>Chat page (origin B, shown inside an iframe)</h1>
+  <ul id="messages"></ul>
+
+  <label for="composer">Message composer</label>
+  <div id="composer" contenteditable="true" aria-label="Message composer"></div>
+
+  <label for="note-input">Note</label>
+  <textarea id="note-input"></textarea>
+
+  <button id="send-btn">Send</button>
+
+<script>
+  const messagesEl = document.getElementById('messages');
+  const composer = document.getElementById('composer');
+  const note = document.getElementById('note-input');
+
+  function report() {
+    parent.postMessage({
+      rig: 'frame-state',
+      origin: location.origin,
+      messages: [...messagesEl.querySelectorAll('li')].map((li) => li.textContent),
+      note: note.value,
+      composer: composer.textContent
+    }, '*');
+  }
+
+  document.getElementById('send-btn').addEventListener('click', () => {
+    const li = document.createElement('li');
+    li.textContent = composer.textContent;
+    messagesEl.appendChild(li);
+    composer.textContent = '';
+    report();
+  });
+
+  composer.addEventListener('input', report);
+  note.addEventListener('input', report);
+  report();
+</script>
+</body>
+</html>
