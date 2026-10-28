@@ -394,6 +394,13 @@ def main():
         log(f"extension connected to relay: {st['relay']}")
 
         # ---- share the parent tab and get a pairing code -------------------
+        # The prompt pump starts BEFORE the pair: since v2.7.0 the pair
+        # itself waits on the one full-control confirmation card, so the
+        # rig-as-user must be answering the panel before pairing begins.
+        pump = PromptPump(panel, window_id)
+        pump.start()
+        log("panel prompt pump running (auto-approves panel cards, logging each)")
+
         cdp.call("Target.activateTarget", {"targetId": parent_target})
         r = panel.send("share", {"tabId": tab_id})
         log(f"share requested: {r}")
@@ -411,10 +418,6 @@ def main():
         if not out.get("ok"):
             raise RuntimeError(f"client pair failed: {out}")
         log(f"chat paired as {out.get('chatName')!r} session {out.get('sessionId')}")
-
-        pump = PromptPump(panel, window_id)
-        pump.start()
-        log("panel prompt pump running (auto-approves permission prompts, logging each)")
 
         rc, out = client(chatdir, "tabs_context", "{}")
         if not out.get("ok") or not out.get("data", {}).get("tabs"):
