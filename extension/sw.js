@@ -20,7 +20,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.7.1";
+const VERSION = "2.7.2";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -248,6 +248,32 @@ function relaySend(obj) {
   return false;
 }
 
+// A command result that finishes while the relay link is down is not
+// lost (Claude's bridge buffers tool results the same way): it is kept
+// — newest 8, for 120 s, one per command id — and redelivered when the
+// link returns. Error results are not buffered: a chat that never sees
+// an error treats the call as timed out and retries it, which is the
+// safer failure than a late error landing on a call it already retried.
+const RESULT_BUFFER_MAX = 8;
+const RESULT_BUFFER_TTL_MS = 120000;
+let resultBuffer = []; // [{id, msg, expiresAt}]
+function sendResult(msg) {
+  if (relaySend(msg)) return true;
+  if (msg && msg.ok) {
+    const now = Date.now();
+    resultBuffer = resultBuffer.filter((b) => b.id !== msg.id && b.expiresAt > now);
+    resultBuffer.push({ id: msg.id, msg, expiresAt: now + RESULT_BUFFER_TTL_MS });
+    while (resultBuffer.length > RESULT_BUFFER_MAX) resultBuffer.shift();
+  }
+  return false;
+}
+function flushResultBuffer() {
+  if (!resultBuffer.length) return;
+  const keep = resultBuffer.filter((b) => b.expiresAt > Date.now());
+  resultBuffer = [];
+  for (const b of keep) sendResult(b.msg);
+}
+
 async function onRelay(msg) {
   switch (msg.t) {
     case "welcome":
@@ -257,6 +283,7 @@ async function onRelay(msg) {
         clearInterval(heartbeat);
         heartbeat = setInterval(() => relaySend({ t: "heartbeat" }), 20000); // keeps the worker alive while connected
         await reconcile(msg);
+        flushResultBuffer(); // results that finished while the link was down
       } else {
         await local.set("relayError", msg.error || "rejected");
       }
@@ -910,6 +937,25 @@ async function cursor(tabId, cmd) {
 async function cursorGo(tabId, x, y, pulse) {
   await cursor(tabId, { op: "go", x: Math.round(x), y: Math.round(y), pulse: !!pulse });
 }
+// Hide every on-page indicator before a screenshot and restore them
+// after (Claude's HIDE_FOR_TOOL_USE / SHOW_AFTER_TOOL_USE, with its
+// 50 ms beat between hiding and the action): a capture must never
+// contain the bridge's own cursor or pill. Best-effort like the rest of
+// the visual layer — a page that refuses scripts keeps its indicators,
+// and a capture is never failed by this.
+async function pillForCapture(tabId, op) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId },
+      func: (c) => { if (window.__museBridgePill) window.__museBridgePill(c); }, args: [{ op }] });
+  } catch (e) { /* not scriptable */ }
+}
+async function hideIndicatorsForCapture(tabId) {
+  await Promise.all([cursor(tabId, { op: "hideForCapture" }), pillForCapture(tabId, "hideForCapture")]);
+  await sleep(50);
+}
+async function showIndicatorsAfterCapture(tabId) {
+  await Promise.all([cursor(tabId, { op: "showAfterCapture" }), pillForCapture(tabId, "showAfterCapture")]);
+}
 // Keep each tab's recorded site current, and re-draw the pill after a page load.
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (!info.url && info.status !== "complete") return;
@@ -1252,7 +1298,7 @@ async function onCommand(msg) {
                 deadline: Date.now() + clamp(Number(msg.ttlMs) || DEFAULT_TTL_MS, 5000, 600000) - 1500 };
   const reply = (out) => {
     inflight.delete(id); persistInflight();
-    relaySend({ t: "result", id, ...out });
+    sendResult({ t: "result", id, ...out });
   };
   msg.action = toolName(msg.action);
   if (!own(TOOLS, msg.action)) return reply(unknownTool(msg.action));
@@ -1463,6 +1509,11 @@ async function attach(tabId) {
       try { await chrome.debugger.attach({ tabId }, "1.3"); }
       catch (e) { if (!/already attached/i.test(String(e && e.message))) throw fail("input_unavailable", String(e && e.message)); }
       attached.set(tabId, Date.now());
+      // Page.enable always (Claude's attach sequence): without it the
+      // Page.javascriptDialogOpening event never fires and a page dialog
+      // would block the tab with no way through. Best-effort — a page
+      // that refuses it still takes input.
+      await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
     })().finally(() => attaching.delete(tabId)));
   }
   return attaching.get(tabId);
@@ -1471,6 +1522,8 @@ async function detach(tabId) {
   worlds.delete(tabId);
   const hadEmu = focusEmuTabs.delete(tabId);
   bridgeClicks.delete(tabId);
+  buPolicy.delete(tabId);
+  releaseBuWaiter(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
   // Claude's detach order: end focus emulation first, then detach.
@@ -1483,10 +1536,83 @@ async function detach(tabId) {
 chrome.debugger.onDetach.addListener(async (src, reason) => {
   attached.delete(src.tabId); worlds.delete(src.tabId);
   focusEmuTabs.delete(src.tabId); bridgeClicks.delete(src.tabId);
+  buPolicy.delete(src.tabId); releaseBuWaiter(src.tabId);
   if (reason !== "canceled_by_user") return;
   // The user pressed Cancel on Chrome's "being debugged" bar: stop that chat.
   const sid = await ownerOf(src.tabId);
   if (sid) await dropSession(sid, { tellRelay: true, why: "stopped from Chrome's debugging bar" });
+});
+
+/* ---------------------------------------------------------- page dialogs */
+// Claude in Chrome's dialog policy, copied from its CDP wrapper. A
+// beforeunload ("Leave site?") dialog is answered from a per-tab policy
+// the navigate tool arms before it moves the tab: "accept" only when
+// the caller passed force, "dismiss" otherwise — and "dismiss" whenever
+// no policy is armed, which is the state during every other command.
+// The policy is one-shot; the outcome is recorded per tab for the
+// navigate wrapper to consume, and a dismissal releases the wrapper's
+// wait at once (a top-frame navigation releases it too). alert /
+// confirm / prompt carry no policy in Claude's code either — but under
+// a debugger session an unanswered dialog blocks the page outright, so
+// here they are answered at once: alert accepted (it has only an OK),
+// confirm and prompt declined. Every answer is written to the event
+// record. A page dialog must never hang a command again.
+const buPolicy = new Map();   // tabId -> "accept" | "dismiss" (one-shot)
+const buOutcome = new Map();  // tabId -> {action: "accepted"|"dismissed", url, at}
+const buWaiters = new Map();  // tabId -> () => void
+function releaseBuWaiter(tabId) {
+  const w = buWaiters.get(tabId);
+  if (w) { buWaiters.delete(tabId); w(); }
+}
+function setBeforeunloadPolicy(tabId, policy) {
+  buPolicy.set(tabId, policy);
+  buOutcome.delete(tabId);
+  releaseBuWaiter(tabId);
+}
+function waitForBeforeunloadResolution(tabId, ms) {
+  const o = buOutcome.get(tabId);
+  if (o && o.action === "dismissed") return Promise.resolve();
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (done) return; done = true; clearTimeout(timer); buWaiters.delete(tabId); resolve(); };
+    buWaiters.set(tabId, finish);
+    const timer = setTimeout(finish, ms);
+  });
+}
+function consumeBeforeunloadOutcome(tabId) {
+  const o = buOutcome.get(tabId) || null;
+  buOutcome.delete(tabId);
+  buPolicy.delete(tabId);
+  return o;
+}
+async function dialogAudit(tabId, action, detail, outcome) {
+  const sid = await ownerOf(tabId).catch(() => null);
+  const s = sid ? (await getSessions())[sid] : null;
+  await audit(s ? s.chatName : "", action, detail, outcome);
+}
+async function onDialogOpening(tabId, params) {
+  const type = (params && params.type) || "";
+  if (type === "beforeunload") {
+    const accept = (buPolicy.get(tabId) || "dismiss") === "accept";
+    buPolicy.delete(tabId);
+    buOutcome.set(tabId, { action: accept ? "accepted" : "dismissed", url: (params && params.url) || "", at: Date.now() });
+    if (!accept) releaseBuWaiter(tabId);
+    await cdp(tabId, "Page.handleJavaScriptDialog", { accept }).catch(() => {});
+    await dialogAudit(tabId, "Leave site? dialog", P.clip((params && params.url) || "", 120),
+      accept ? "accepted — left the page; unsaved changes discarded" : "dismissed — page kept");
+    return;
+  }
+  if (type === "alert" || type === "confirm" || type === "prompt") {
+    const accept = type === "alert";
+    await cdp(tabId, "Page.handleJavaScriptDialog", { accept }).catch(() => {});
+    await dialogAudit(tabId, type + " dialog", P.clip((params && params.message) || "", 120),
+      accept ? "accepted" : "dismissed");
+  }
+}
+chrome.debugger.onEvent.addListener((src, method, params) => {
+  if (!src || src.tabId == null) return;
+  if (method === "Page.javascriptDialogOpening") onDialogOpening(src.tabId, params).catch(() => {});
+  else if (method === "Page.frameNavigated" && params && params.frame && !params.frame.parentId) releaseBuWaiter(src.tabId);
 });
 
 // Allow-list of CDP methods: every method a current call site in this file
@@ -1510,24 +1636,54 @@ const CDP_METHODS = new Set([
   "Input.insertText",
   "Page.captureScreenshot",
   "Page.createIsolatedWorld",
+  "Page.enable",
   "Page.getFrameTree",
   "Page.getLayoutMetrics",
   "Page.getNavigationHistory",
+  "Page.handleJavaScriptDialog",
   "Page.navigateToHistoryEntry",
   "Runtime.callFunctionOn",
 ]);
+
+function cdpError(method, params, e) {
+  // Name the step that hung: a bare cdp_timeout does not say which step failed.
+  if (e && e.code === "cdp_timeout" && !e.detail) e.detail = method + (params && params.type ? " " + params.type : "");
+  if (e && e.code) return e;
+  return fail("page_error", method + ": " + String(e && e.message));
+}
+// Whether a failed CDP call means the debugger session dropped from
+// under it, judged the way Claude's sendCommandWithReattach judges it:
+// the two detach messages count on their own; the cross-extension
+// access message counts only when the debugger really is detached.
+async function sessionDropped(tabId, e) {
+  if (!e || e.code === "cdp_timeout") return false;
+  const m = String((e && e.message) || e || "").toLowerCase();
+  if (m.includes("debugger is not attached") || m.includes("detached while handling command")) return true;
+  if (m.includes("cannot access a chrome-extension:// url of different extension")) {
+    const targets = await chrome.debugger.getTargets().catch(() => []);
+    const t = (targets || []).find((x) => x.tabId === tabId);
+    return !(t && t.attached);
+  }
+  return false;
+}
 
 async function cdp(tabId, method, params, ms) {
   if (!CDP_METHODS.has(method)) throw fail("cdp_method_not_allowed", String(method));
   await attach(tabId);
   attached.set(tabId, Date.now());
+  const send = () => withTimeout(chrome.debugger.sendCommand({ tabId }, method, params || {}), ms || CDP_MS, "cdp_timeout");
   try {
-    return await withTimeout(chrome.debugger.sendCommand({ tabId }, method, params || {}), ms || CDP_MS, "cdp_timeout");
+    return await send();
   } catch (e) {
-    // Name the step that hung: a bare cdp_timeout does not say which step failed.
-    if (e.code === "cdp_timeout" && !e.detail) e.detail = method + (params && params.type ? " " + params.type : "");
-    if (e.code) throw e;
-    throw fail("page_error", method + ": " + String(e && e.message));
+    if (!(await sessionDropped(tabId, e))) throw cdpError(method, params, e);
+    // The session dropped mid-call: forget it, reattach once, retry the
+    // call once (Claude's model). A second failure is the real answer —
+    // it is reported, never looped on.
+    attached.delete(tabId); focusEmuTabs.delete(tabId); worlds.delete(tabId);
+    await attach(tabId);
+    attached.set(tabId, Date.now());
+    try { return await send(); }
+    catch (e2) { throw cdpError(method, params, e2); }
   }
 }
 
@@ -2562,6 +2718,24 @@ function sameUrl(a, b) {
   } catch (e) { return false; }
 }
 
+// Run a tab-moving action under the tab's beforeunload policy
+// (Claude's navigate wrapper): arm the policy from force, run the move,
+// wait briefly for a dialog outcome, consume it. The caller reads the
+// returned outcome: null (no dialog), or {action:"accepted"} — a
+// dismissal throwsIfDialogBlocked turns into the blocked error.
+async function navUnderDialogPolicy(tabId, force, fn) {
+  setBeforeunloadPolicy(tabId, force ? "accept" : "dismiss");
+  await fn();
+  await waitForBeforeunloadResolution(tabId, 300);
+  return consumeBeforeunloadOutcome(tabId);
+}
+function throwIfDialogBlocked(outcome, fromUrl) {
+  if (outcome && outcome.action === "dismissed") {
+    throw fail("navigation_blocked", `Navigation was blocked by a "Leave site?" dialog — the page at ${P.clip(fromUrl || "", 120)} has unsaved changes. The page is still open and unchanged. Either address the unsaved state first, or retry with force: true to discard it and navigate anyway.`);
+  }
+}
+const DISCARDED_DIALOG_NOTE = 'discarded a "Leave site?" dialog — the page had unsaved changes that are now lost';
+
 TOOLS.navigate = async (ctx, a) => {
   const url = String(a.url || "");
   if (url === "back" || url === "forward") {
@@ -2573,11 +2747,13 @@ TOOLS.navigate = async (ctx, a) => {
     if (P.isWebUrl(entry.url)) await permitSite(ctx, P.hostOf(entry.url), `Go ${url} to ${P.clip(entry.url, 120)}`);
     else if (entry.url !== "about:blank") throw fail("restricted_page", "history leads to a browser page");
     await recheck(ctx, tab);
-    await cdp(tab.id, "Page.navigateToHistoryEntry", { entryId: entry.id });
+    const outcome = await navUnderDialogPolicy(tab.id, a.force === true,
+      () => cdp(tab.id, "Page.navigateToHistoryEntry", { entryId: entry.id }));
+    throwIfDialogBlocked(outcome, tab.url);
     const t = await waitCommitted(tab.id, false, tab.url);
     await resolveTab(ctx, t.id, { allowNonWeb: true, why: `History redirected to ${P.hostOf(t.url)}.` });
     await audit(ctx.chat, "navigate " + url, P.isWebUrl(t.url) ? P.hostOf(t.url) : "blank", "ok");
-    return { tabId: t.id, url: t.url, title: t.title };
+    return { tabId: t.id, url: t.url, title: t.title, ...(outcome ? { note: DISCARDED_DIALOG_NOTE } : {}) };
   }
   const full = /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : "https://" + url;
   if (!P.isWebUrl(full)) throw fail("bad_url", "only http and https");
@@ -2587,7 +2763,7 @@ TOOLS.navigate = async (ctx, a) => {
   // removing that tab cancels this command.
   if (a.tabId != null) noteJobTab(ctx, Number(a.tabId));
   await permitSite(ctx, host, `Open ${P.clip(full, 120)}`);
-  let tabId, prev = "about:blank";
+  let tabId, prev = "about:blank", dialogOutcome = null;
   if (a.tabId != null) {
     // Replacing the page in a tab counts as acting on it: its current site
     // must be permitted too (or it is blank / a browser page).
@@ -2602,7 +2778,9 @@ TOOLS.navigate = async (ctx, a) => {
       return { tabId: tab.id, url: tab.url, title: tab.title, reloaded: false, active: !!(a.active || tab.active) };
     }
     prev = tab.url;
-    await chrome.tabs.update(tab.id, a.active ? { url: full, active: true } : { url: full });
+    dialogOutcome = await navUnderDialogPolicy(tab.id, a.force === true,
+      () => chrome.tabs.update(tab.id, a.active ? { url: full, active: true } : { url: full }));
+    throwIfDialogBlocked(dialogOutcome, prev);
     tabId = tab.id;
   } else {
     checkLive(ctx);
@@ -2623,7 +2801,8 @@ TOOLS.navigate = async (ctx, a) => {
   }
   const t = await waitCommitted(tabId, a.waitUntil === "load", prev);
   await audit(ctx.chat, "navigate", full, "ok");
-  return { tabId, url: t.url, title: t.title, redirectedToOtherSite: P.hostOf(t.url) !== host };
+  return { tabId, url: t.url, title: t.title, redirectedToOtherSite: P.hostOf(t.url) !== host,
+           ...(dialogOutcome ? { note: DISCARDED_DIALOG_NOTE } : {}) };
 };
 
 TOOLS.read_page = async (ctx, a) => {
@@ -2831,12 +3010,19 @@ async function shoot(ctx, a, region, via) {
       if (background && e.code === "cdp_timeout") throw fail("tab_not_visible", "this tab is in the background and Chrome does not draw it. Use read_page or get_page_text for it, or ask the user to switch to it.");
       throw e;
     });
-  let format = "png";
-  let r = await capture(format);
-  // Keep the reply well under the relay's 16 MB message limit.
-  if (r.data.length > SHOT_MAX_B64) { format = "jpeg"; r = await capture(format); }
-  while (r.data.length > SHOT_MAX_B64 && scale > 0.15) { scale = Math.round(scale * 60) / 100; r = await capture(format); }
-  if (r.data.length > SHOT_MAX_B64) throw fail("result_too_large", "use zoom on a smaller region");
+  // The bridge's own cursor and pill are on this page: hide them before
+  // capturing and restore them after, so no screenshot contains them.
+  await hideIndicatorsForCapture(tab.id);
+  let format = "png", r;
+  try {
+    r = await capture(format);
+    // Keep the reply well under the relay's 16 MB message limit.
+    if (r.data.length > SHOT_MAX_B64) { format = "jpeg"; r = await capture(format); }
+    while (r.data.length > SHOT_MAX_B64 && scale > 0.15) { scale = Math.round(scale * 60) / 100; r = await capture(format); }
+    if (r.data.length > SHOT_MAX_B64) throw fail("result_too_large", "use zoom on a smaller region");
+  } finally {
+    await showIndicatorsAfterCapture(tab.id);
+  }
   await assertHost(tab, host);
   const image = `data:image/${format};base64,` + r.data;
   await audit(ctx.chat, region ? "zoom" : "screenshot", via ? `${via} @ ${host} (${image.length} chars)` : `${host} (${image.length} chars)`, "ok");
@@ -3387,7 +3573,10 @@ async function captureLiveView(sessionId, tabId) {
     notifyPanel();
     return true;
   }
-  const image = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 50 });
+  await hideIndicatorsForCapture(tabId);
+  let image;
+  try { image = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 50 }); }
+  finally { await showIndicatorsAfterCapture(tabId); }
   // The page may have moved or been given to another chat while the shot
   // was taken: never show one page under another page's name.
   const after = await chrome.tabs.get(tabId).catch(() => null);
