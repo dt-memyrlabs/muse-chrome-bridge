@@ -59,6 +59,12 @@ const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
   F.FakeWS.last.deliver({ t: "pair_code", reqId: req.reqId, code: "WXYZ9876", expiresIn: 300 });
   await tick(10);
   F.FakeWS.last.deliver({ t: "paired", reqId: req.reqId, sessionId: "sessW", chatName: "Work Chat" });
+  // v2.7: the share lands only on the ONE full-control confirmation.
+  for (let i = 0; i < 200; i++) {
+    const sp = ((await F.panel("state")).prompts || []).find((p) => /full control/i.test(p.title));
+    if (sp) { await F.panel("approve", { id: sp.id }); break; }
+    await tick(5);
+  }
   await tick(40);
   const stHere = await F.panel("state", { windowId: 2 });
   const chatHere = stHere.chats.find((c) => c.sessionId === "sessW");
