@@ -198,7 +198,9 @@
     // role="textbox" is a disguised control, not a text field, and its
     // words are judged exactly as a click would judge them. Genuine
     // fields skip this and keep the form-submit branch below as their
-    // only prompt (SEC-06), so Enter in a field is never double-gated.
+    // only classification (SEC-06), so Enter in a field is never
+    // double-classified. (Since v2.7 a classification feeds the event
+    // record, not a prompt; the shapes below are unchanged.)
     const genuineField = !!f.isContentEditable ||
       ["input", "textarea", "select"].includes(String(f.tag || "").toLowerCase()) ||
       (!f.tag && !!f.isField);
@@ -213,7 +215,8 @@
     return { ask: false };
   }
 
-  // Typing characters with focus f: passwords and blind spots ask.
+  // Typing characters with focus f: passwords and blind spots are the
+  // sensitive classifications (recorded, and masked, under v2.7).
   function classifyTyping(f) {
     if (!f) return { ask: false };
     if (f.kind === "crossOriginFrame") return { ask: true, password: true, reason: `The typing goes into a frame from ${f.frameHost || "another site"}. Muse cannot see if it is a password field.` };
@@ -222,8 +225,8 @@
     return { ask: false };
   }
 
-  // A field whose own value is secret: it is never shown in a prompt or the
-  // audit log. Payment fields count, like password fields.
+  // A field whose own value is secret: it is never shown in the event
+  // record or the audit log. Payment fields count, like password fields.
   function isSecretField(d) {
     return !!(d && (d.isPassword || d.isPayField));
   }
@@ -250,7 +253,7 @@
     return s.length > n ? s.slice(0, n) + "…" : s;
   }
 
-  // Human description of an element for prompts and the audit log.
+  // Human description of an element for the event record and audit log.
   // Never includes a password field's value (the probe never returns one).
   function describeTarget(d) {
     if (!d) return "(nothing there)";
@@ -268,7 +271,7 @@
   function shownTyping(text, isPassword) {
     const t = String(text == null ? "" : text);
     if (isPassword) return `(${[...t].length} characters, hidden)`;
-    // No length cap: an approval prompt must show the whole value that will
+    // No length cap: the record must show the whole value that will
     // be filled, not a clipped preview of it (SEC-06 repair).
     return '"' + t.replace(/\s+/g, " ").trim() + '"';
   }
