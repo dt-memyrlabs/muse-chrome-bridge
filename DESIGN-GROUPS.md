@@ -182,3 +182,47 @@ that an emptied group disappears):
    the audit log with its reason. Group changes also schedule delayed
    re-checks (a drag can report a passing group id before the tab
    settles), and the re-check is idempotent.
+
+## v2.7.1 — grouping failures are never silent; refusing windows are escaped
+
+Live failure (Daniel, 2026-10-28): on his desktop Chrome the share and
+control worked but NO group ever appeared in the strip, and nothing
+anywhere said grouping had failed. The code's only trace was one audit
+line (error clipped, write swallowed on failure), the panel state
+carried no group information at all, and the only retry driver was the
+membership sync — which fires on group-shaped events a never-grouped
+tab never produces. "The bridge keeps retrying" was not true.
+
+What changed, copied from Claude in Chrome's group manager (REA
+extraction: groupMetadata/memberStates tracking, groupTabInOwnWindow,
+adoptOrphanedGroup, followRotatedGroupId, handleTabGroupChange):
+
+- **Own tracking, reconciled.** The worker already tracked each chat's
+  group per window (`session.groups`, re-verified by title before use);
+  it now also reconciles on tab lifecycle events — activation, load
+  complete, window focus (`retryGrouping`) — not only on group events.
+  Group-id rotation is followed: whichever write lands first (the
+  sync's `rememberGroup` overwrite or the group-removed handler's
+  delete) leaves exactly one "group id changed" line in the record.
+  A titled group the cache lost (orphan) is adopted back by the same
+  reconciliation; no duplicate is created.
+- **A refusing window is escaped, not retried.** Failures are
+  classified. A transient refusal (tab mid-drag, Chrome mid-edit) is
+  recorded and retried later; nothing moves. A refusing window — type
+  not "normal", or Chrome's "Grouping is not supported by tabs in this
+  window" — sends the tab to `groupTabViaOwnWindow`: it joins the
+  chat's existing group in another window if one exists (no scatter),
+  else it gets a window of its own (`chrome.windows.create({tabId})`,
+  unfocused) and starts the group there. One move per tab per chat,
+  guarded against the move's own events, and every move is written to
+  the event record with the refusal that caused it.
+- **Failure is durable and visible.** The session record keeps the
+  last grouping failure (`groupError`: Chrome's real error text +
+  window type); panel `state` computes per chat `grouped` /
+  `groupMissing` live and carries `groupError`, `groupWindowType`,
+  `groupStopped` (retry bound hit). The panel renders it in plain
+  words under the chat — including the can't-form-here wording for
+  non-normal windows. The error clears only when no tab of the chat
+  still carries a retry mark. Retries stay bounded by the same mark
+  (GROUP_RETRY_MAX = 8) shared by the sync and the lifecycle retries,
+  and a groupless tab is still never released for being groupless.
