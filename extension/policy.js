@@ -463,6 +463,21 @@
    *                     for the screenshot gate: the same classifications,
    *                     computed in-page over EVERY field (no cap).
    *   "text"            the page's main text.
+   *   "tree"            this frame's OWN element tree (the all-frames
+   *                     read: the worker runs it in every frame of the
+   *                     tab and stitches the results). Entries carry
+   *                     role and name in the tree builder's shape plus
+   *                     describe()'s classification facts — the
+   *                     protections' own classifier, never a second
+   *                     one — and each element's centre in THIS frame's
+   *                     viewport coordinates. The elements themselves
+   *                     are stashed on the window under a.build for
+   *                     "measure".
+   *   "measure"         {build, i}: scroll the stashed element into
+   *                     view and report its fresh centre, its checked
+   *                     state, and its describe() facts.
+   *   "frames"          this document's iframe elements with their
+   *                     rects, so the worker can add up frame offsets.
    * It never returns the value of a password field. */
   function pageProbe(mode, a) {
     a = a || {};
@@ -562,7 +577,13 @@
           if (n.shadowRoot) for (const c of n.shadowRoot.children || []) stack.push(c);
         }
       }
-      return parts.join(" ").replace(/\s+/g, " ").trim();
+      // The scans above can find the same <label> up to three times
+      // (el.labels, a document scan, a tree walk). For classification
+      // the repeats were harmless; as a field's NAME they multiply
+      // ("Note Note Note"), so identical parts are kept once.
+      const uniq = [];
+      for (const p of parts) { const t = (p || "").replace(/\s+/g, " ").trim(); if (t && !uniq.includes(t)) uniq.push(t); }
+      return uniq.join(" ");
     }
     // Visit every element under root, piercing open shadow roots and
     // same-origin frames (querySelectorAll alone does neither). Cross-origin
@@ -789,6 +810,132 @@
       for (let n = b, i = 0; n && i < 200; i++, n = up(n)) if (n === a) return true;
       return false;
     }
+    // ---- the all-frames tree (modes "tree" / "measure" / "frames") ----
+    // Claude in Chrome builds its element tree inside every frame (a
+    // content script registered for all frames); the bridge runs the
+    // same builder per frame through scripting instead. A frame reports
+    // only its OWN document — it never reaches across a frame boundary.
+    // Role and name follow the tree builder's shape; every classification
+    // fact comes from describe() above, so a framed field is judged by
+    // exactly the rules a top-frame field is judged by.
+    const ROLE_BY_TAG = (el) => {
+      const t = el.tagName;
+      if (t === "A") return el.hasAttribute && el.hasAttribute("href") ? "link" : "";
+      if (t === "BUTTON") return "button";
+      if (t === "TEXTAREA") return "textbox";
+      if (t === "SELECT") return "combobox";
+      if (t === "IMG") return "image";
+      if (/^H[1-6]$/.test(t)) return "heading";
+      if (t === "IFRAME" || t === "FRAME") return "Iframe";
+      if (t === "INPUT") {
+        const ty = typeOf(el);
+        if (ty === "checkbox") return "checkbox";
+        if (ty === "radio") return "radio";
+        if (ty === "submit" || ty === "button" || ty === "reset" || ty === "image" || ty === "file") return "button";
+        if (ty === "range") return "slider";
+        if (ty === "number") return "spinbutton";
+        if (ty === "search") return "searchbox";
+        return "textbox";
+      }
+      return "";
+    };
+    const LANDMARK = { NAV: "navigation", MAIN: "main", HEADER: "banner", FOOTER: "contentinfo",
+                       ASIDE: "complementary", FORM: "form", UL: "list", OL: "list", LI: "listitem", TABLE: "table" };
+    const clampProbe = (v, dflt) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.floor(n) : dflt; };
+    const treeVisible = (el) => {
+      const st = style(el);
+      if (st && (st.display === "none" || st.visibility === "hidden" || st.visibility === "collapse")) return false;
+      try { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; } catch (e) { return false; }
+    };
+    const hasOwnText = (el) => {
+      for (const n of el.childNodes || []) if (n.nodeType === 3 && (n.textContent || "").trim().length >= 3) return true;
+      return false;
+    };
+    function buildFrameTree() {
+      const maxDepth = clampProbe(a.depth, 15), cap = clampProbe(a.max, 3000), visitCap = 10000;
+      const entries = [], els = [];
+      let visited = 0, truncated = false;
+      const walk = (el, depth) => {
+        if (truncated || !isEl(el)) return;
+        if (++visited > visitCap) { truncated = true; return; }
+        if (attr(el, "aria-hidden") === "true") return;
+        const tag = el.tagName;
+        // LABEL gets no entry of its own: its text already names
+          // its control through describe() (the AX tree does the same),
+          // and a separate label entry would duplicate the control's
+          // name in find/read_page; a press on it focuses nothing.
+          if (!/^(SCRIPT|STYLE|META|LINK|TITLE|NOSCRIPT|TEMPLATE|LABEL)$/.test(tag)) {
+          // Cheap candidacy first: describe() is the expensive read
+          // (label and form scans), so it runs only on elements that
+          // could plausibly enter the tree.
+          let cand = false;
+          try {
+            cand = el.matches(ACT) || !!el.isContentEditable ||
+              /^(INPUT|TEXTAREA|SELECT|BUTTON|A|IMG|IFRAME|FRAME|SUMMARY|LABEL)$/.test(tag) ||
+              /^H[1-6]$/.test(tag) || !!LANDMARK[tag] ||
+              !!attr(el, "role") || !!attr(el, "aria-label") || !!attr(el, "alt") || hasOwnText(el);
+          } catch (e) { cand = true; }
+          if (cand) {
+            const d = describe(el, "");
+            const role = attr(el, "role").toLowerCase() || ROLE_BY_TAG(el) || LANDMARK[tag] ||
+              (d.isContentEditable ? "textbox" : "");
+            const name = (d.isField ? (d.label || d.text) : (d.text || d.label)).slice(0, 100);
+            const inter = d.actionableShape || d.isField || /^(IFRAME|FRAME)$/.test(tag);
+            if ((inter || !!name || !!LANDMARK[tag] || role === "heading") &&
+                (treeVisible(el) || a.filter === "all" || d.isField)) {
+              const r = el.getBoundingClientRect();
+              const e = { i: els.length, depth, role, name,
+                tag: d.tag, type: d.type, text: d.text, label: d.label, href: d.href,
+                autocomplete: d.autocomplete, isField: d.isField, isPassword: d.isPassword,
+                isPayField: d.isPayField, isContentEditable: d.isContentEditable,
+                isSubmit: d.isSubmit, revealsSecret: d.revealsSecret, actionableShape: d.actionableShape,
+                inForm: d.inForm, formHasPassword: d.formHasPassword, formHasPayment: d.formHasPayment,
+                formRiskySubmit: d.formRiskySubmit, fp: d.fp,
+                cx: r.left + r.width / 2, cy: r.top + r.height / 2, w: r.width, h: r.height };
+              if (tag === "INPUT" && (d.type === "checkbox" || d.type === "radio")) e.checked = !!el.checked;
+              if (/^(IFRAME|FRAME)$/.test(tag)) e.src = el.src || "";
+              entries.push(e); els.push(el);
+              if (entries.length >= cap) truncated = true;
+            }
+          }
+        }
+        if (depth >= maxDepth || truncated) return;
+        for (const c of el.children || []) walk(c, depth + 1);
+        if (el.shadowRoot) for (const c of el.shadowRoot.children || []) walk(c, depth + 1);
+      };
+      const rootEl = document.body || document.documentElement;
+      if (rootEl) walk(rootEl, 0);
+      // Stash the live elements for "measure": the isolated world's
+      // window persists across script injections into this frame, so a
+      // later call can scroll and re-measure the very same node.
+      const builds = (window.__mbbTreeBuilds = window.__mbbTreeBuilds || {});
+      const id = String(a.build || "b0");
+      builds[id] = els;
+      const keys = Object.keys(builds);
+      if (keys.length > 2) delete builds[keys[0]];
+      return { buildId: id, url: location.href, entries, truncated };
+    }
+    function measureStashed() {
+      const builds = window.__mbbTreeBuilds || {};
+      const els = builds[String(a.build || "")];
+      const el = els && els[Number(a.i)];
+      if (!el || !el.isConnected) return null;
+      try { el.scrollIntoView({ block: "center", inline: "center" }); } catch (e) {}
+      const r = el.getBoundingClientRect();
+      return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, w: r.width, h: r.height,
+               checked: typeof el.checked === "boolean" ? el.checked : undefined, d: describe(el, "") };
+    }
+    function frameRects() {
+      const out = [];
+      let list = [];
+      try { list = [...document.querySelectorAll("iframe,frame")]; } catch (e) {}
+      for (const el of list) {
+        const r = el.getBoundingClientRect();
+        out.push({ src: el.src || "", left: r.left, top: r.top,
+                   clientLeft: el.clientLeft || 0, clientTop: el.clientTop || 0, w: r.width, h: r.height });
+      }
+      return out;
+    }
     function run() {
       if (mode === "point" || mode === "refpoint") {
         const h = hitAt(a.x, a.y);
@@ -870,6 +1017,9 @@
         const el = document.querySelector("main, article, [role=main]") || document.body;
         return (el ? el.innerText : "").slice(0, 100000);
       }
+      if (mode === "tree") return buildFrameTree();
+      if (mode === "measure") return measureStashed();
+      if (mode === "frames") return frameRects();
       return null;
     }
     return { host: location.host.toLowerCase(), v: run.call(this) };
