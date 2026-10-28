@@ -28,7 +28,10 @@ If two chats share a working folder, give each its own --token-file.
 
 Tools: tabs_context, tabs_create, tabs_close, navigate, read_page, find,
 get_page_text, get_form_values, screenshot, computer, form_input,
-file_upload, browser_batch.   (See SKILL.md for arguments.)
+file_upload, browser_batch, read_console_messages, read_network_requests,
+resize_window, upload_image, update_plan, shortcuts_list,
+shortcuts_execute, javascript_tool, gif_creator.
+(See SKILL.md for arguments.)
 
 Output is always one line of JSON. Exit code 0 = ok, 1 = the call failed,
 2 = bad usage. Screenshots are saved as files next to the token file, and
@@ -56,6 +59,10 @@ HTTP_TIMEOUT = 135  # longer than the relay's 120 s command deadline
 PAGE_CONTENT_TOOLS = frozenset({
     "read_page", "get_page_text", "find", "get_form_values",
     "screenshot", "computer", "browser_batch",
+    # v2.8: console text, request URLs and evaluated values all come
+    # from the page; a recorded GIF is page imagery like a screenshot.
+    "read_console_messages", "read_network_requests", "javascript_tool",
+    "gif_creator",
     # tabs_context returns each permitted tab's title (page-controlled
     # document.title); navigate returns the loaded page's title;
     # form_input returns a descriptor built from the page element's
