@@ -20,7 +20,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.7.2";
+const VERSION = "2.8.0";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -438,19 +438,31 @@ async function attachTab(sessionId, tab) {
   else memRemove(tab.id); // no such session: undo the mirror move above
   return chat;
 }
+/* Tabs released just now (tabId -> timestamp). Membership sync must
+ * never re-adopt a tab out of its group in the moments after a
+ * release: the release itself passes through states (out of the
+ * record, still in the group) that read as a drag-in adoption. */
+const recentlyReleased = new Map();
 async function releaseTab(tabId) {
   // Synchronous, before the first await: the tab leaves its chat now.
   // Cancel its work in this same tick (not after the state write), and
   // if it was the chat's last tab, settle the chat's tabless prompts
   // too — an Allow racing this removal must find nothing to answer.
   const memOwnerSid = memRemove(tabId);
+  recentlyReleased.set(Number(tabId), Date.now());
   cancelTabWork(tabId, null);
   if (memOwnerSid) cancelIfSessionEmpty(memOwnerSid);
   let ownerSid = null;
-  const chat = await withState((st) => {
-    let name = null;
-    for (const [sid, v] of Object.entries(st)) if (v.tabs && own(v.tabs, String(tabId))) { delete v.tabs[String(tabId)]; name = v.chatName; ownerSid = sid; }
-    return name;
+  let chat = null;
+  const before = await getSessions();
+  for (const [sid, v] of Object.entries(before)) if (v.tabs && own(v.tabs, String(tabId))) { chat = v.chatName; ownerSid = sid; }
+  // Ungroup BEFORE the record drops the tab. While the record still
+  // lists it, membership sync reads the tab as owned and groupless —
+  // "leaving", the same end state — never as a fresh tab sitting in a
+  // titled group waiting to be adopted back.
+  await ungroupTab(tabId, chat);
+  await withState((st) => {
+    for (const v of Object.values(st)) if (v.tabs) delete v.tabs[String(tabId)];
   });
   // Unsharing a tab cancels its pending prompts and in-flight commands
   // for the chat that held it, the same way a transfer does.
@@ -458,7 +470,6 @@ async function releaseTab(tabId) {
   pill(tabId, null);
   void cursor(tabId, null); // an unshared tab keeps neither the pill nor the cursor
   forgetTabView(tabId);
-  await ungroupTab(tabId, chat);
   await detach(tabId);
   if (ownerSid) { await clearGroupRetry(ownerSid, tabId); await clearGroupMoved(ownerSid, tabId); await dropIfEmpty(ownerSid, "last tab removed"); }
   return chat;
@@ -470,6 +481,14 @@ async function releaseTab(tabId) {
 // title is the identity, and a cached id is re-verified against the live
 // group's window and title before every use.
 const groupTitle = (s) => `Muse · ${s.chatName}`;
+// v2.8 (FULL-GAP §8): the group title carries a state prefix like
+// Claude's — ⌛ while the chat is working, 🔔 while it waits on the
+// user, ✅ when its last job finished. Group IDENTITY is the bare
+// title: every comparison goes through sameGroupTitle so a prefix
+// never breaks membership, adoption, or rotation following.
+function stripGroupPrefix(title) { return String(title || "").replace(/^(⌛|🔔|✅)\s?/, ""); }
+function displayGroupTitle(s) { return (s && s.groupPrefix ? s.groupPrefix + " " : "") + groupTitle(s); }
+function sameGroupTitle(a, b) { return stripGroupPrefix(a) === stripGroupPrefix(b); }
 function groupColor(chatName) {
   let h = 0;
   for (const c of String(chatName || "")) h = (h * 31 + c.charCodeAt(0)) >>> 0;
@@ -537,6 +556,33 @@ async function clearGroupRetry(sessionId, tabId) {
   await withState((st) => { const v = st[sessionId]; if (v && v.groupRetry) delete v.groupRetry[String(tabId)]; }).catch(() => {});
 }
 
+/* The state prefix a chat's group title should carry right now:
+ * 🔔 while one of its prompts waits on the user, ⌛ while a command
+ * is in flight, ✅ after its last command finished, none before the
+ * first. Retitling retries the way Claude's does (3 tries, 500 ms
+ * apart) — a group Chrome is mid-edit with refuses once, then takes it. */
+async function desiredGroupPrefix(sessionId) {
+  for (const p of pending.values()) if (p.sessionId === sessionId) return "🔔";
+  for (const j of inflight.values()) if (j.sessionId === sessionId) return "⌛";
+  const s = (await getSessions())[sessionId];
+  return s && s.lastJobDoneAt ? "✅" : null;
+}
+async function refreshGroupPrefix(sessionId) {
+  if (!sessionId) return;
+  const want = await desiredGroupPrefix(sessionId);
+  const s = (await getSessions())[sessionId];
+  if (!s || (s.groupPrefix || null) === want) return;
+  await withState((st) => { if (st[sessionId]) st[sessionId].groupPrefix = want; });
+  const s2 = (await getSessions())[sessionId];
+  if (!s2) return;
+  for (const gid of Object.values(s2.groups || {})) {
+    for (let i = 0; i < 3; i++) {
+      try { await chrome.tabGroups.update(Number(gid), { title: displayGroupTitle(s2) }); break; }
+      catch (e) { if (i < 2) await sleep(500); }
+    }
+  }
+}
+
 async function groupTab(sessionId, tab) {
   if (!tab || tab.windowId == null) return;
   let chat = "";
@@ -549,11 +595,11 @@ async function groupTab(sessionId, tab) {
     const stored = s.groups ? Number(s.groups[String(tab.windowId)]) : NaN;
     if (Number.isInteger(stored) && stored >= 0) {
       const g = await chrome.tabGroups.get(stored).catch(() => null);
-      if (g && g.windowId === tab.windowId && g.title === title) gid = g.id;
+      if (g && g.windowId === tab.windowId && sameGroupTitle(g.title, title)) gid = g.id;
     }
     if (gid == null) {
       const inWindow = await chrome.tabGroups.query({ windowId: tab.windowId }).catch(() => []);
-      const hit = (inWindow || []).find((g) => g.title === title);
+      const hit = (inWindow || []).find((g) => sameGroupTitle(g.title, title));
       if (hit) gid = hit.id;
     }
     if (gid != null && tab.groupId === gid) { await rememberGroup(sessionId, tab.windowId, gid); await clearGroupRetry(sessionId, tab.id); await clearGroupError(sessionId); return; }
@@ -562,7 +608,7 @@ async function groupTab(sessionId, tab) {
       // Claude's groupTabInOwnWindow shape: name the tab's own window
       // explicitly when the group is created.
       gid = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } });
-      await chrome.tabGroups.update(gid, { title, color: groupColor(s.chatName) });
+      await chrome.tabGroups.update(gid, { title: displayGroupTitle(s), color: groupColor(s.chatName) });
     }
     await rememberGroup(sessionId, tab.windowId, gid);
     await clearGroupRetry(sessionId, tab.id);
@@ -611,11 +657,11 @@ async function groupTabViaOwnWindow(sessionId, tab, causeMsg) {
     for (const [w, id] of Object.entries(s0.groups || {})) {
       if (Number(w) === tab.windowId) continue;
       const g = await chrome.tabGroups.get(Number(id)).catch(() => null);
-      if (g && g.title === title) { gid = g.id; break; }
+      if (g && sameGroupTitle(g.title, title)) { gid = g.id; break; }
     }
     if (gid == null) {
-      const all = await chrome.tabGroups.query({ title }).catch(() => []);
-      const hit = (all || []).find((g) => g.windowId !== tab.windowId);
+      const all = await chrome.tabGroups.query({}).catch(() => []);
+      const hit = (all || []).find((g) => sameGroupTitle(g.title, title) && g.windowId !== tab.windowId);
       if (hit) gid = hit.id;
     }
     if (gid != null) {
@@ -633,7 +679,7 @@ async function groupTabViaOwnWindow(sessionId, tab, causeMsg) {
     const win = await chrome.windows.create({ tabId: tab.id, type: "normal", focused: false });
     if (!win || win.id == null) return false;
     gid = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: win.id } });
-    await chrome.tabGroups.update(gid, { title, color: groupColor(s0.chatName), collapsed: false });
+    await chrome.tabGroups.update(gid, { title: displayGroupTitle(s0), color: groupColor(s0.chatName), collapsed: false });
     await rememberGroup(sessionId, win.id, gid);
     await clearGroupRetry(sessionId, tab.id);
     await clearGroupError(sessionId);
@@ -657,7 +703,7 @@ async function ungroupTab(tabId, chatName) {
     if (!t || t.groupId == null || t.groupId === -1) return;
     if (chatName) {
       const g = await chrome.tabGroups.get(t.groupId).catch(() => null);
-      if (!g || g.title !== `Muse · ${chatName}`) return;
+      if (!g || !sameGroupTitle(g.title, `Muse · ${chatName}`)) return;
     }
     await chrome.tabs.ungroup(tabId);
   } catch (e) { /* the tab or its group is already gone */ }
@@ -681,12 +727,31 @@ function syncTabGroupMembership(tabId) {
       const g = await chrome.tabGroups.get(tab.groupId).catch(() => null);
       if (g && g.windowId === tab.windowId) {
         for (const [sid, s] of Object.entries(sessions)) {
-          if (s.groups && Number(s.groups[String(tab.windowId)]) === tab.groupId && groupTitle(s) === g.title) { groupSid = sid; break; }
+          if (s.groups && Number(s.groups[String(tab.windowId)]) === tab.groupId && sameGroupTitle(g.title, groupTitle(s))) { groupSid = sid; break; }
         }
-        if (!groupSid) for (const [sid, s] of Object.entries(sessions)) if (groupTitle(s) === g.title) { groupSid = sid; break; }
+        if (!groupSid) for (const [sid, s] of Object.entries(sessions)) if (sameGroupTitle(g.title, groupTitle(s))) { groupSid = sid; break; }
       }
     }
     const ownerSid = memOwner.get(tabId) || (await ownerOf(tabId));
+    if (!groupSid && ownerSid && tab.groupId != null && tab.groupId !== -1) {
+      // The tab sits in a group no session claims. If every member of
+      // that group already belongs to this tab's chat, the group is
+      // the chat's in everything but name (the user grouped its tabs
+      // by hand): adopt the group — remember it, title it — instead
+      // of reading the tab as having left its chat.
+      const grp = await chrome.tabGroups.get(tab.groupId).catch(() => null);
+      const members = grp && grp.windowId === tab.windowId
+        ? await chrome.tabs.query({ groupId: tab.groupId }).catch(() => []) : [];
+      const ownerTabs = new Set(Object.keys((sessions[ownerSid] || {}).tabs || {}).map(Number));
+      if (members.length > 1 && members.every((m) => ownerTabs.has(m.id))) {
+        const s = sessions[ownerSid];
+        await rememberGroup(ownerSid, tab.windowId, tab.groupId);
+        await chrome.tabGroups.update(tab.groupId, { title: displayGroupTitle(s), color: groupColor(s.chatName) }).catch(() => {});
+        await audit(s.chatName, "tab group", "adopted the group these tabs were already in", "ok").catch(() => {});
+        groupSid = ownerSid;
+      }
+    }
+    if (groupSid && groupSid !== ownerSid && (recentlyReleased.get(tabId) || 0) > Date.now() - 3000) return; // a release in flight, not a drag-in
     if (groupSid && groupSid !== ownerSid) {
       // Daniel moved this tab into a chat's group: adopt it, with the
       // same checks as the panel's Add tab (web page only, attachTab
@@ -784,7 +849,7 @@ async function retryGrouping(tabId) {
   if (mark > GROUP_RETRY_MAX) return; // bounded: stopped; the panel state says so
   if (tab.groupId != null && tab.groupId !== -1) {
     const g = await chrome.tabGroups.get(tab.groupId).catch(() => null);
-    if (g && g.title === groupTitle(s)) {
+    if (g && sameGroupTitle(g.title, groupTitle(s))) {
       await rememberGroup(sid, tab.windowId, tab.groupId);
       await clearGroupRetry(sid, tabId);
       await clearGroupError(sid);
@@ -794,7 +859,10 @@ async function retryGrouping(tabId) {
   await groupTab(sid, tab);
 }
 chrome.tabs.onActivated.addListener((info) => {
-  if (info && info.tabId != null) retryGrouping(info.tabId).catch(() => {});
+  if (info && info.tabId != null) {
+    retryGrouping(info.tabId).catch(() => {});
+    unmuteAfterFocusEmulation(info.tabId).catch(() => {}); // the user is looking at it now
+  }
 });
 if (chrome.windows && chrome.windows.onFocusChanged) chrome.windows.onFocusChanged.addListener((windowId) => {
   if (windowId == null || windowId < 0) return; // no window focused
@@ -838,7 +906,7 @@ chrome.tabGroups.onRemoved.addListener(async (g) => {
       const t = await chrome.tabs.get(id).catch(() => null);
       if (!t || t.windowId !== g.windowId || t.groupId == null || t.groupId === -1 || t.groupId === g.id) continue;
       const ng = await chrome.tabGroups.get(t.groupId).catch(() => null);
-      if (ng && ng.title === groupTitle(s)) { rotatedTo = t.groupId; break; }
+      if (ng && sameGroupTitle(ng.title, groupTitle(s))) { rotatedTo = t.groupId; break; }
     }
     const removedHere = await withState((st) => {
       const v = st[sid];
@@ -861,7 +929,7 @@ chrome.tabGroups.onRemoved.addListener(async (g) => {
 async function adoptGroupTabsAtStartup() {
   const sessions = await getSessions();
   for (const [sid, s] of Object.entries(sessions)) {
-    const found = await chrome.tabGroups.query({ title: groupTitle(s) }).catch(() => []);
+    const found = (await chrome.tabGroups.query({}).catch(() => [])).filter((g) => sameGroupTitle(g.title, groupTitle(s)));
     for (const g of found || []) {
       const members = await chrome.tabs.query({ groupId: g.id }).catch(() => []);
       for (const tab of members) {
@@ -935,6 +1003,7 @@ async function cursor(tabId, cmd) {
 // click lands. Resolves when the glide has finished on screen, so callers
 // fire the real action only after the user has seen the cursor arrive.
 async function cursorGo(tabId, x, y, pulse) {
+  if (Number.isFinite(x) && Number.isFinite(y)) cursorPos.set(tabId, { x: Math.round(x), y: Math.round(y) });
   await cursor(tabId, { op: "go", x: Math.round(x), y: Math.round(y), pulse: !!pulse });
 }
 // Hide every on-page indicator before a screenshot and restore them
@@ -949,18 +1018,32 @@ async function pillForCapture(tabId, op) {
       func: (c) => { if (window.__museBridgePill) window.__museBridgePill(c); }, args: [{ op }] });
   } catch (e) { /* not scriptable */ }
 }
+async function agentUIForCapture(tabId, op) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId },
+      func: (c) => { if (window.__museBridgeAgentUI) window.__museBridgeAgentUI(c); }, args: [{ op }] });
+  } catch (e) { /* not scriptable */ }
+}
 async function hideIndicatorsForCapture(tabId) {
-  await Promise.all([cursor(tabId, { op: "hideForCapture" }), pillForCapture(tabId, "hideForCapture")]);
+  await Promise.all([cursor(tabId, { op: "hideForCapture" }), pillForCapture(tabId, "hideForCapture"), agentUIForCapture(tabId, "hideForCapture")]);
   await sleep(50);
 }
 async function showIndicatorsAfterCapture(tabId) {
-  await Promise.all([cursor(tabId, { op: "showAfterCapture" }), pillForCapture(tabId, "showAfterCapture")]);
+  await Promise.all([cursor(tabId, { op: "showAfterCapture" }), pillForCapture(tabId, "showAfterCapture"), agentUIForCapture(tabId, "showAfterCapture")]);
 }
 // Keep each tab's recorded site current, and re-draw the pill after a page load.
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (!info.url && info.status !== "complete") return;
   const sid = await ownerOf(tabId);
   if (!sid) return;
+  // A shared tab that reaches a blocked site is sent to the blocked
+  // page as soon as the navigation is seen (Claude's behavior), not
+  // left there until the next command.
+  if (info.url && P.isWebUrl(info.url) && await siteBlocked(info.url)) {
+    const s = (await getSessions())[sid];
+    await enforceSiteBlock(tabId, info.url, s && s.chatName);
+    return;
+  }
   if (info.url) await withState((st) => { if (st[sid] && st[sid].tabs && own(st[sid].tabs, String(tabId))) st[sid].tabs[String(tabId)] = P.hostOf(info.url); });
   if (info.status === "complete") pill(tabId, (await getSessions())[sid].chatName);
 });
@@ -1192,6 +1275,20 @@ async function onPaired(msg) {
     }
     await attachTab(msg.sessionId, tab);
     await audit(chatName, "paired", share.host, "connected");
+    // A scheduled prompt's run is delivered when a chat pairs with
+    // the code the run prepared: usage is recorded, the run closes.
+    if (share.runId) {
+      const runs = await local.get("promptRuns", []);
+      const run = runs.find((x) => x.id === share.runId);
+      if (run && run.status.startsWith("awaiting chat")) {
+        run.status = "delivered to " + chatName;
+        run.deliveredAt = Date.now();
+        await local.set("promptRuns", runs);
+        const list = await getSavedPrompts();
+        const p = list.find((x) => x.id === run.promptId);
+        if (p) { p.usageCount = (p.usageCount || 0) + 1; p.lastUsedAt = Date.now(); await setSavedPrompts(list); }
+      }
+    }
     ack(true);
   } catch (e) {
     ack(false, "pair_failed: " + ((e && e.message) || e));
@@ -1245,6 +1342,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   // an Allow racing the close must not beat it (see releaseTab).
   const memOwnerSid = memRemove(tabId);
   if (memOwnerSid) cancelIfSessionEmpty(memOwnerSid);
+  if (emuMuted.delete(tabId)) sess.set("emuMuted", [...emuMuted]).catch(() => {}); // the tab is gone; nothing to unmute
+  workingTabs.delete(tabId); consoleBuffers.delete(tabId); networkBuffers.delete(tabId);
   detach(tabId); dropRefs(tabId); worlds.delete(tabId); forgetTabView(tabId);
   withState((st) => {
     const owners = [];
@@ -1262,7 +1361,62 @@ function noteJobTab(ctx, tabId) {
   if (tabId == null || !Number.isFinite(Number(tabId))) return;
   tabId = Number(tabId);
   if (ctx) { ctx.tabId = tabId; noteActivity(ctx.sessionId, tabId); }
-  if (ctx && ctx.job) (ctx.job.tabs || (ctx.job.tabs = new Set())).add(tabId);
+  if (ctx && ctx.job) {
+    (ctx.job.tabs || (ctx.job.tabs = new Set())).add(tabId);
+    // v2.8 indicators: this tab is being worked right now.
+    let set = workingTabs.get(tabId);
+    if (!set) { set = new Set(); workingTabs.set(tabId, set); }
+    if (!set.has(ctx.job.id)) { set.add(ctx.job.id); refreshAgentIndicators(ctx.sessionId).catch(() => {}); }
+  }
+}
+
+/* -------------------------------------------------- agent indicators */
+// v2.8 (FULL-GAP §8): while a chat works, its tab shows the working
+// layer — a pulsing glow border and a Stop button — and the chat's
+// other tabs show the static "Muse is active in this tab group"
+// pill. agent-ui.js draws them; these helpers drive it the way the
+// pill and cursor are driven. Best-effort presentation, like theirs.
+const workingTabs = new Map(); // tabId -> Set<jobId>
+const agentUIReady = new Map(); // tabId -> url agent-ui.js was injected into
+async function agentUI(tabId, cmd) {
+  try {
+    if (!cmd) { // removal needs no live tab record and no injection
+      await chrome.scripting.executeScript({ target: { tabId },
+        func: (c) => { if (window.__museBridgeAgentUI) return window.__museBridgeAgentUI(c); }, args: [null] }).catch(() => {});
+      agentUIReady.delete(tabId);
+      return;
+    }
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (!t) return;
+    if (agentUIReady.get(tabId) !== t.url) {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["agent-ui.js"] });
+      agentUIReady.set(tabId, t.url);
+    }
+    await chrome.scripting.executeScript({ target: { tabId },
+      func: (c) => { if (window.__museBridgeAgentUI) return window.__museBridgeAgentUI(c); }, args: [cmd] });
+  } catch (e) { /* not scriptable: no show */ }
+}
+async function staticDismissed(sessionId, tabId) {
+  const d = await sess.get("staticDismissed", {});
+  return !!(d && d[sessionId + ":" + tabId]);
+}
+async function refreshAgentIndicators(sessionId) {
+  const s = (await getSessions())[sessionId];
+  if (!s) return;
+  for (const idStr of Object.keys(s.tabs || {})) {
+    const tabId = Number(idStr);
+    const working = (workingTabs.get(tabId) || new Set()).size > 0;
+    const statik = !working && !(await staticDismissed(sessionId, tabId));
+    await agentUI(tabId, { working, static: statik });
+  }
+}
+function jobFinished(job) {
+  let touched = false;
+  for (const tabId of job.tabs || []) {
+    const set = workingTabs.get(tabId);
+    if (set && set.delete(job.id)) { touched = true; if (!set.size) workingTabs.delete(tabId); }
+  }
+  if (touched && job.sessionId) refreshAgentIndicators(job.sessionId).catch(() => {});
 }
 
 function persistInflight() {
@@ -1298,18 +1452,34 @@ async function onCommand(msg) {
                 deadline: Date.now() + clamp(Number(msg.ttlMs) || DEFAULT_TTL_MS, 5000, 600000) - 1500 };
   const reply = (out) => {
     inflight.delete(id); persistInflight();
+    if (job.sessionId) {
+      withState((st) => { if (st[job.sessionId]) st[job.sessionId].lastJobDoneAt = Date.now(); }).catch(() => {});
+      jobFinished(job);
+      refreshGroupPrefix(job.sessionId).catch(() => {});
+    }
     sendResult({ t: "result", id, ...out });
   };
   msg.action = toolName(msg.action);
   if (!own(TOOLS, msg.action)) return reply(unknownTool(msg.action));
   job.action = msg.action; job.tabs = new Set();
   inflight.set(id, job); persistInflight();
+  refreshGroupPrefix(msg.sessionId).catch(() => {});
   let ctx;
   try { ctx = await sessionCtx(msg.sessionId); }
   catch (e) { return reply(errOf(e)); }
   ctx.job = job;
   try {
     const data = await TOOLS[msg.action](ctx, msg.args && typeof msg.args === "object" && !Array.isArray(msg.args) ? msg.args : {});
+    // GIF recording (v2.8, §7): while this chat records, the actions
+    // Claude's recorder frames — computer, navigate, screenshot —
+    // each leave a frame taken right after they land.
+    if (msg.action !== "gif_creator" && ["computer", "navigate", "screenshot"].includes(msg.action)) {
+      const grec = gifSessions.get(msg.sessionId);
+      if (grec && grec.recording && !job.canceled) {
+        const tabId = ctx.tabId != null ? ctx.tabId : (job.tabs && [...job.tabs][0]);
+        if (tabId != null) await captureGifFrame(msg.sessionId, tabId, msg).catch(() => {});
+      }
+    }
     // The tab (or the session) went away while this ran: the caller gets
     // a cancellation, never the data the command gathered.
     if (job.canceled) return reply({ ok: false, error: "canceled", detail: job.canceledByTab ? "the tab was removed or transferred, or the chat disconnected, while this call was running" : "the relay stopped waiting for this call" });
@@ -1420,6 +1590,7 @@ function ask(ctx, title, detail, url, opts) {
               url: url || "", created: Date.now(), expiresAt: Date.now() + ms, timer,
               resolve: (ok, code) => (ok ? resolve() : reject(fail(code))) };
     pending.set(id, entry);
+    if (entry.sessionId) refreshGroupPrefix(entry.sessionId).catch(() => {}); // 🔔 while it waits
     chrome.action.setBadgeText({ text: String(pending.size) }).catch(() => {});
     chrome.action.setBadgeBackgroundColor({ color: "#d97706" }).catch(() => {});
     chrome.notifications.create("mbb-" + id, {
@@ -1489,6 +1660,7 @@ function settle(id, allow, code) {
   chrome.action.setBadgeText({ text: pending.size ? String(pending.size) : "" }).catch(() => {});
   audit(p.chat, "prompt: " + p.title, p.detail, allow ? "allowed" : code);
   p.resolve(allow, allow ? null : code || "denied_by_user");
+  if (p.sessionId) refreshGroupPrefix(p.sessionId).catch(() => {});
   notifyPanel();
 }
 chrome.notifications.onClicked.addListener(async () => {
@@ -1514,6 +1686,12 @@ async function attach(tabId) {
       // would block the tab with no way through. Best-effort — a page
       // that refuses it still takes input.
       await chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
+      // Console + network capture for the read tools (v2.8, FULL-GAP
+      // §5), enabled the same way Claude enables them on its debugger
+      // session. Best-effort: a session that refuses them still
+      // attaches; the read tools then simply have nothing buffered.
+      await chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}).catch(() => {});
+      await chrome.debugger.sendCommand({ tabId }, "Network.enable", {}).catch(() => {});
     })().finally(() => attaching.delete(tabId)));
   }
   return attaching.get(tabId);
@@ -1521,9 +1699,11 @@ async function attach(tabId) {
 async function detach(tabId) {
   worlds.delete(tabId);
   const hadEmu = focusEmuTabs.delete(tabId);
+  if (hadEmu) unmuteAfterFocusEmulation(tabId).catch(() => {});
   bridgeClicks.delete(tabId);
   buPolicy.delete(tabId);
   releaseBuWaiter(tabId);
+  consoleBuffers.delete(tabId); networkBuffers.delete(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
   // Claude's detach order: end focus emulation first, then detach.
@@ -1535,8 +1715,10 @@ async function detach(tabId) {
 }
 chrome.debugger.onDetach.addListener(async (src, reason) => {
   attached.delete(src.tabId); worlds.delete(src.tabId);
-  focusEmuTabs.delete(src.tabId); bridgeClicks.delete(src.tabId);
+  if (focusEmuTabs.delete(src.tabId)) unmuteAfterFocusEmulation(src.tabId).catch(() => {});
+  bridgeClicks.delete(src.tabId);
   buPolicy.delete(src.tabId); releaseBuWaiter(src.tabId);
+  consoleBuffers.delete(src.tabId); networkBuffers.delete(src.tabId);
   if (reason !== "canceled_by_user") return;
   // The user pressed Cancel on Chrome's "being debugged" bar: stop that chat.
   const sid = await ownerOf(src.tabId);
@@ -1609,16 +1791,142 @@ async function onDialogOpening(tabId, params) {
       accept ? "accepted" : "dismissed");
   }
 }
+/* ---- site blocklist (v2.8, FULL-GAP §3) ----------------------------
+ * Claude hard-refuses category 1/2 sites and sites matching the
+ * managed blockedUrlPatterns, sending the tab to a blocked page.
+ * The mechanism is replicated whole: the same pattern matcher
+ * (policy.js), patterns read from chrome.storage.managed with a
+ * change listener, and a per-host category map. The DATA is not
+ * replicated, because in theirs it does not ship: categories come
+ * from a hosted safety check and the patterns from org policy. Our
+ * category map (storage.local "siteCategories") therefore ships
+ * EMPTY and no managed patterns exist unless an org sets them. */
+let managedPatternsCache = null;
+function normalizePatterns(v) {
+  // Their loader's shape: a JSON array string, or a single string.
+  if (Array.isArray(v)) return v.filter((x) => typeof x === "string").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  if (typeof v !== "string") return [];
+  const e = v.trim();
+  if (!e) return [];
+  if (e.startsWith("[")) {
+    try { const t = JSON.parse(e); if (Array.isArray(t)) return t.filter((x) => typeof x === "string").map((x) => x.trim().toLowerCase()).filter(Boolean); } catch (err) { return []; }
+    return [];
+  }
+  return [e.toLowerCase()];
+}
+async function managedPatterns() {
+  if (managedPatternsCache) return managedPatternsCache;
+  let pats = [];
+  try {
+    if (chrome.storage.managed && chrome.storage.managed.get) {
+      const v = await chrome.storage.managed.get("blockedUrlPatterns");
+      pats = normalizePatterns(v && v.blockedUrlPatterns);
+    }
+  } catch (e) { pats = []; }
+  managedPatternsCache = pats;
+  return pats;
+}
+if (chrome.storage.onChanged) chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "managed" && changes && changes.blockedUrlPatterns) managedPatternsCache = null;
+});
+async function siteBlocked(url) {
+  if (!url || !P.isWebUrl(url)) return false;
+  const host = P.hostOf(url);
+  const cats = await local.get("siteCategories", {});
+  const c = cats && host ? cats[host] : undefined;
+  if (c === 1 || c === 2 || c === "category1" || c === "category2") return true;
+  const pats = await managedPatterns();
+  return pats.some((p) => P.matchBlockedPattern(url, p));
+}
+async function enforceSiteBlock(tabId, url, chat) {
+  await chrome.tabs.update(tabId, { url: chrome.runtime.getURL("blocked.html") }).catch(() => {});
+  await audit(chat || "tab", "site blocked", P.hostOf(url || ""), "refused: blocked site category or managed pattern");
+}
+
+/* ---- per-tab console + network capture (v2.8, FULL-GAP §5) --------
+ * Claude keeps a bounded buffer per tab, reset when the tab's domain
+ * changes, fed by the same debugger events enabled at attach. Ours
+ * mirrors that shape: console entries cap at 10000, requests at 1000,
+ * and console timestamps are clamped so they never run backwards. */
+const MAX_CONSOLE_PER_TAB = 10000;
+const MAX_REQUESTS_PER_TAB = 1000;
+const consoleBuffers = new Map(); // tabId -> {domain, messages: [], lastTs}
+const networkBuffers = new Map(); // tabId -> {domain, requests: Map}
+async function bufferFor(map, tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return null;
+  const domain = P.hostOf(tab.url || tab.pendingUrl || "");
+  let b = map.get(tabId);
+  if (!b || b.domain !== domain) {
+    b = map === consoleBuffers ? { domain, messages: [], lastTs: 0 } : { domain, requests: new Map() };
+    map.set(tabId, b);
+  }
+  return b;
+}
+function consoleArgText(a) {
+  if (!a) return "";
+  if (a.value !== undefined) return String(a.value);
+  return String(a.description || a.type || "");
+}
+function onConsoleEvent(tabId, method, params) {
+  bufferFor(consoleBuffers, tabId).then((b) => {
+    if (!b || !params) return;
+    if (method === "Runtime.consoleAPICalled") {
+      const text = (params.args || []).map(consoleArgText).join(" ");
+      const frame = params.stackTrace && params.stackTrace.callFrames && params.stackTrace.callFrames[0];
+      const ts = Math.max(Number(params.timestamp) || 0, b.lastTs);
+      b.lastTs = ts;
+      b.messages.push({ type: String(params.type || "log"), text: P.clip(text, 16384), timestamp: ts,
+        ...(frame ? { url: frame.url, lineNumber: frame.lineNumber, columnNumber: frame.columnNumber } : {}) });
+    } else { // Runtime.exceptionThrown
+      const ex = params.exceptionDetails || {};
+      const d = ex.exception || {};
+      const ts = Math.max(Number(params.timestamp) || 0, b.lastTs);
+      b.lastTs = ts;
+      b.messages.push({ type: "exception", text: P.clip(String(d.description || d.value || ex.text || "exception"), 16384),
+        timestamp: ts, ...(ex.url ? { url: ex.url, lineNumber: ex.lineNumber, columnNumber: ex.columnNumber } : {}) });
+    }
+    if (b.messages.length > MAX_CONSOLE_PER_TAB) b.messages.splice(0, b.messages.length - MAX_CONSOLE_PER_TAB);
+  }).catch(() => {});
+}
+function onNetworkEvent(tabId, method, params) {
+  bufferFor(networkBuffers, tabId).then((b) => {
+    if (!b || !params || !params.requestId) return;
+    const id = String(params.requestId);
+    if (method === "Network.requestWillBeSent") {
+      const r = params.request || {};
+      b.requests.set(id, { requestId: id, url: String(r.url || ""), method: String(r.method || ""),
+        timestamp: Number(params.timestamp) || 0 });
+      while (b.requests.size > MAX_REQUESTS_PER_TAB) b.requests.delete(b.requests.keys().next().value);
+    } else {
+      const rec = b.requests.get(id);
+      if (!rec) return;
+      if (method === "Network.responseReceived") {
+        const resp = params.response || {};
+        rec.status = resp.status;
+        if (resp.mimeType) rec.mimeType = String(resp.mimeType);
+      } else if (method === "Network.loadingFailed") {
+        rec.status = 503; // Claude records a failed load as 503
+        if (params.errorText) rec.errorText = String(params.errorText);
+      }
+    }
+  }).catch(() => {});
+}
 chrome.debugger.onEvent.addListener((src, method, params) => {
   if (!src || src.tabId == null) return;
   if (method === "Page.javascriptDialogOpening") onDialogOpening(src.tabId, params).catch(() => {});
   else if (method === "Page.frameNavigated" && params && params.frame && !params.frame.parentId) releaseBuWaiter(src.tabId);
+  else if (method === "Runtime.consoleAPICalled" || method === "Runtime.exceptionThrown") onConsoleEvent(src.tabId, method, params);
+  else if (method === "Network.requestWillBeSent" || method === "Network.responseReceived" || method === "Network.loadingFailed") onNetworkEvent(src.tabId, method, params);
 });
 
 // Allow-list of CDP methods: every method a current call site in this file
-// passes to cdp(). Anything else (e.g. Runtime.evaluate, Network.*,
-// Storage.*) is refused here, so no future or indirect caller can reach
-// arbitrary DevTools protocol methods through this dispatcher.
+// passes to cdp(). Anything else (e.g. Storage.*) is refused here, so no
+// future or indirect caller can reach arbitrary DevTools protocol methods
+// through this dispatcher. Runtime.evaluate is on the list for ONE call
+// site only — the javascript_tool path, which refuses unless the user has
+// enabled it in the panel (v2.8); Runtime/Network enable exist so the
+// per-tab console and network buffers can be captured for the read tools.
 const CDP_METHODS = new Set([
   "Accessibility.getFullAXTree",
   "Accessibility.getPartialAXTree",
@@ -1631,9 +1939,11 @@ const CDP_METHODS = new Set([
   "DOM.scrollIntoViewIfNeeded",
   "DOM.setFileInputFiles",
   "Emulation.setFocusEmulationEnabled",
+  "Input.dispatchDragEvent",
   "Input.dispatchKeyEvent",
   "Input.dispatchMouseEvent",
   "Input.insertText",
+  "Network.enable",
   "Page.captureScreenshot",
   "Page.createIsolatedWorld",
   "Page.enable",
@@ -1643,6 +1953,8 @@ const CDP_METHODS = new Set([
   "Page.handleJavaScriptDialog",
   "Page.navigateToHistoryEntry",
   "Runtime.callFunctionOn",
+  "Runtime.enable",
+  "Runtime.evaluate",
 ]);
 
 function cdpError(method, params, e) {
@@ -1698,6 +2010,32 @@ async function ensureFocusEmulation(tabId) {
   focusEmuTabs.add(tabId);
   await cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true })
     .catch(() => { focusEmuTabs.delete(tabId); });
+  if (focusEmuTabs.has(tabId)) muteForFocusEmulation(tabId).catch(() => {});
+}
+/* Focus-emulation mute parity (Claude's flip-mute, in the shape our
+ * once-per-session emulation needs): a background tab the bridge gives
+ * focus emulation to is muted, so a page that starts playing sound
+ * because it believes it is focused does not surprise the user. Only
+ * tabs WE muted are ever unmuted — a tab the user muted, a tab already
+ * audible, and the foreground tab of the focused window are never
+ * touched. The mute lifts when the user activates the tab, when focus
+ * emulation ends (detach), or at the next worker start (the sweep in
+ * cleanupAfterRestart, from the session-stored list). */
+const emuMuted = new Set(); // tabIds muted by muteForFocusEmulation
+async function muteForFocusEmulation(tabId) {
+  const t = await chrome.tabs.get(tabId).catch(() => null);
+  if (!t || t.audible || (t.mutedInfo && t.mutedInfo.muted)) return;
+  const win = await chrome.windows.get(t.windowId).catch(() => null);
+  if (t.active && win && win.focused && win.state !== "minimized") return; // the tab in front of the focused window
+  await chrome.tabs.update(tabId, { muted: true });
+  emuMuted.add(tabId);
+  await sess.set("emuMuted", [...emuMuted]).catch(() => {});
+}
+async function unmuteAfterFocusEmulation(tabId) {
+  if (!emuMuted.has(tabId)) return;
+  emuMuted.delete(tabId);
+  await sess.set("emuMuted", [...emuMuted]).catch(() => {});
+  await chrome.tabs.update(tabId, { muted: false }).catch(() => {});
 }
 // A press the bridge made itself, remembered per tab: the type path
 // uses it to tell "the click I just made focused a field my probe
@@ -1821,6 +2159,12 @@ async function resolveTab(ctx, tabId, { needSite = true, allowNonWeb = false, wh
     if (needSite && !allowNonWeb) throw fail("restricted_page", "not a web page (about:blank, chrome://, file://); navigate it first");
     await rememberTab(ctx, tab.id);
     return tab;
+  }
+  // Blocked sites are refused before any site grant: the tab is sent
+  // to the blocked page and the command stops here.
+  if (await siteBlocked(tab.url)) {
+    await enforceSiteBlock(tab.id, tab.url, ctx.chat);
+    throw fail("site_blocked", "this site is blocked while the bridge is active (blocked category or managed pattern)");
   }
   if (needSite) {
     const host = P.hostOf(tab.url);
@@ -2484,8 +2828,10 @@ async function axFocused(tabId) {
 }
 
 /* ------------------------------------------------------------------ input */
+const cursorPos = new Map(); // tabId -> {x, y} the pointer was last sent to
 async function mouse(tabId, type, x, y, extra) {
   await ensureFocusEmulation(tabId);
+  if (Number.isFinite(x) && Number.isFinite(y)) cursorPos.set(tabId, { x: Math.round(x), y: Math.round(y) });
   await cdp(tabId, "Input.dispatchMouseEvent", { type, x, y, ...extra });
 }
 const BUTTON_BITS = { left: 1, middle: 4, right: 2 };
@@ -2518,12 +2864,60 @@ function modMask(s) {
   }
   return m;
 }
-async function sendKey(tabId, k) {
+async function keyDownOnly(tabId, k) {
   lastInput.set(tabId, Date.now());
   const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
   await ensureFocusEmulation(tabId);
   await cdp(tabId, "Input.dispatchKeyEvent", { type: k.text ? "keyDown" : "rawKeyDown", text: k.text || undefined, ...base });
+}
+async function keyUpOnly(tabId, k) {
+  const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
   await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
+}
+async function sendKey(tabId, k) {
+  await keyDownOnly(tabId, k);
+  await keyUpOnly(tabId, k);
+}
+
+/* Typing, character by character — Claude in Chrome's type(): every
+ * mappable character goes as a real keyDown/keyUp pair (with the shift
+ * modifier when the character needs it), Enter for \n and \r, and only
+ * a character with no key at all falls back to Input.insertText, one
+ * character at a time. Pages that listen for key events (editors,
+ * shortcuts, validation) see the same events a keyboard would make. */
+const CHAR_KEY = { // punctuation and space: char -> [code, windowsVirtualKeyCode]
+  " ": ["Space", 32], ",": ["Comma", 188], ".": ["Period", 190], "/": ["Slash", 191],
+  ";": ["Semicolon", 186], "'": ["Quote", 222], "[": ["BracketLeft", 219], "]": ["BracketRight", 221],
+  "\\": ["Backslash", 220], "-": ["Minus", 189], "=": ["Equal", 187], "`": ["Backquote", 192],
+};
+const SHIFTED_BASE = { "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8",
+  "(": "9", ")": "0", "_": "-", "+": "=", "{": "[", "}": "]", "|": "\\", ":": ";", '"': "'",
+  "<": ",", ">": ".", "?": "/", "~": "`" };
+function charKey(ch) {
+  if (ch === "\n" || ch === "\r") return { key: "Enter", code: "Enter", vk: 13, text: "\r", modifiers: 0 };
+  if (ch === "\t") return { key: "Tab", code: "Tab", vk: 9, text: "", modifiers: 0 };
+  if (/^[a-z]$/.test(ch)) return { key: ch, code: "Key" + ch.toUpperCase(), vk: ch.toUpperCase().charCodeAt(0), text: ch, modifiers: 0 };
+  if (/^[A-Z]$/.test(ch)) return { key: ch, code: "Key" + ch, vk: ch.charCodeAt(0), text: ch, modifiers: 8 };
+  if (/^[0-9]$/.test(ch)) return { key: ch, code: "Digit" + ch, vk: ch.charCodeAt(0), text: ch, modifiers: 0 };
+  if (own(CHAR_KEY, ch)) { const [code, vk] = CHAR_KEY[ch]; return { key: ch, code, vk, text: ch, modifiers: 0 }; }
+  const base = SHIFTED_BASE[ch];
+  if (base) {
+    if (/^[0-9]$/.test(base)) return { key: ch, code: "Digit" + base, vk: base.charCodeAt(0), text: ch, modifiers: 8 };
+    const [code, vk] = CHAR_KEY[base];
+    return { key: ch, code, vk, text: ch, modifiers: 8 };
+  }
+  return null;
+}
+async function typeText(tabId, text) {
+  for (const ch of String(text)) {
+    const k = charKey(ch);
+    if (!k) { await cdp(tabId, "Input.insertText", { text: ch }); continue; }
+    lastInput.set(tabId, Date.now());
+    await ensureFocusEmulation(tabId);
+    const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
+    await cdp(tabId, "Input.dispatchKeyEvent", { type: k.text ? "keyDown" : "rawKeyDown", text: k.text || "", unmodifiedText: k.text || "", ...base });
+    await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  }
 }
 const isPaste = (k) => (k.key.toLowerCase() === "v" && (k.modifiers & (2 | 4))) || (k.key === "Insert" && (k.modifiers & 8));
 
@@ -2622,6 +3016,24 @@ const toolName = (n) => { n = String(n || ""); return own(TOOL_ALIAS, n) ? TOOL_
 const unknownTool = (n) => ({ ok: false, error: "unknown_action",
                               detail: P.clip(n, 60) + ". Tools: " + Object.keys(TOOLS).filter((t) => t !== "browser_batch").join(", ") + ", browser_batch" });
 
+/* Orphaned tabs (v2.8, FULL-GAP §11): Claude's findOrphanedTabs —
+ * an ungrouped web tab whose opener is one of the chat's tabs. Ours
+ * SURFACES them (panel + tabs_context) for a one-click Add through
+ * the ordinary share confirmation; it never takes one silently. A
+ * chat must not gain a tab the user did not share just because a
+ * page opened it — that property is deliberate (see the SEC-23
+ * checks) and automatic adoption would break it. */
+async function findOrphanedTabs(sessionId) {
+  const s = (await getSessions())[sessionId];
+  if (!s || !s.tabs) return [];
+  const mine = new Set(Object.keys(s.tabs).map(Number));
+  if (!mine.size) return [];
+  const all = await chrome.tabs.query({}).catch(() => []);
+  return (all || []).filter((t) => (t.groupId == null || t.groupId === -1) &&
+      t.openerTabId != null && mine.has(Number(t.openerTabId)) && P.isWebUrl(t.url || "") && !mine.has(t.id))
+    .map((t) => ({ tabId: t.id, title: t.title || "", url: t.url, host: P.hostOf(t.url || "") }));
+}
+
 TOOLS.tabs_context = async (ctx) => {
   const tabs = await sessionTabs(ctx.sessionId);
   const s = (await getSessions())[ctx.sessionId];
@@ -2635,6 +3047,7 @@ TOOLS.tabs_context = async (ctx) => {
                site: web ? host : (!t.url || t.url === "about:blank") ? "about:blank" : "(browser page)" };
     }),
     permittedSites: Object.keys(s.sites),
+    orphans: await findOrphanedTabs(ctx.sessionId),
   };
 };
 
@@ -2981,6 +3394,18 @@ function shotKind(sens) {
   return parts.join(" and ");
 }
 
+// Force Chrome to draw one frame of a background tab: a capture that
+// is thrown away. Returns whether a draw was attempted and answered.
+async function forceTabDraw(tab) {
+  const win = await chrome.windows.get(tab.windowId).catch(() => null);
+  if (win && win.state === "minimized") return false;
+  try {
+    await cdp(tab.id, "Page.captureScreenshot",
+      { format: "jpeg", quality: 1, captureBeyondViewport: false, fromSurface: true }, 3000);
+    return true;
+  } catch (e) { return false; }
+}
+
 async function shoot(ctx, a, region, via) {
   const tab = await resolveTab(ctx, a.tabId);
   const host = P.hostOf(tab.url);
@@ -3001,13 +3426,19 @@ async function shoot(ctx, a, region, via) {
   const kind = shotKind(await shotProbeSens(tab, host));
   if (kind) await noteSharedAction(ctx, "Screenshot a page with " + kind,
     `The page on ${host} has ${kind}. A screenshot shows everything visible on the page, including what is typed into those fields.`);
-  // Chrome draws only the tab in front of each window. A background tab never
-  // produces a frame, so its capture would hang: give up quickly and say why.
+  // Chrome draws only the tab in front of each window, so a background
+  // tab has no fresh frame to capture. Claude in Chrome forces one: a
+  // throwaway capture at the lowest quality makes Chrome draw the tab,
+  // and the real capture right after it finds a frame (their drawTab /
+  // drawHiddenTab). A minimized window cannot be drawn at all — skip
+  // the attempt there. If the real capture still times out, the tab
+  // truly cannot be drawn: say so, as before.
   const background = !tab.active;
+  if (background) await forceTabDraw(tab);
   const capture = (format) => cdp(tab.id, "Page.captureScreenshot",
     { format, ...(format === "jpeg" ? { quality: 80 } : {}), clip: { ...clip, scale }, fromSurface: true },
-    background ? 3000 : undefined).catch((e) => {
-      if (background && e.code === "cdp_timeout") throw fail("tab_not_visible", "this tab is in the background and Chrome does not draw it. Use read_page or get_page_text for it, or ask the user to switch to it.");
+    background ? 6000 : undefined).catch((e) => {
+      if (background && e.code === "cdp_timeout") throw fail("tab_not_visible", "this tab is in the background and Chrome does not draw it even when asked. Use read_page or get_page_text for it, or ask the user to switch to it.");
       throw e;
     });
   // The bridge's own cursor and pill are on this page: hide them before
@@ -3026,16 +3457,40 @@ async function shoot(ctx, a, region, via) {
   await assertHost(tab, host);
   const image = `data:image/${format};base64,` + r.data;
   await audit(ctx.chat, region ? "zoom" : "screenshot", via ? `${via} @ ${host} (${image.length} chars)` : `${host} (${image.length} chars)`, "ok");
-  return { tabId: tab.id, image, viewport: { width: v.w, height: v.h },
+  const out = { tabId: tab.id, image, viewport: { width: v.w, height: v.h },
            scroll: { x: v.x, y: v.y }, scale, note: "click coordinates are viewport CSS pixels (full resolution)" };
+  // Like Claude's, a capture is kept under an id so upload_image can
+  // put it back onto a page. The store is per chat and small.
+  if (ctx.sessionId) out.imageId = mintImage(ctx.sessionId, r.data, format);
+  return out;
 }
 TOOLS.screenshot = (ctx, a) => shoot(ctx, a, null);
+
+/* Captured images by id (for upload_image). Per chat, newest kept. */
+const sessionImages = new Map(); // sessionId -> [{id, base64, format}]
+let imageSeq = 0;
+function mintImage(sessionId, base64, format) {
+  const id = "img_" + (++imageSeq);
+  const list = sessionImages.get(sessionId) || [];
+  list.push({ id, base64, format: format || "png" });
+  while (list.length > 8) list.shift();
+  sessionImages.set(sessionId, list);
+  return id;
+}
+function getImage(sessionId, imageId) {
+  return (sessionImages.get(sessionId) || []).find((x) => x.id === imageId) || null;
+}
 
 TOOLS.computer = async (ctx, a) => {
   // Names other agents use for the same actions (kept as aliases).
   const ALIAS = { press_key: "key", key_press: "key", keypress: "key", press: "key", click: "left_click", type_text: "type" };
   const action = own(ALIAS, String(a.action || "")) ? ALIAS[a.action] : String(a.action || "");
-  if (action === "wait") { await sleep(clamp(Number(a.duration) || 1, 0, 10) * 1000); return {}; }
+  if (action === "wait") {
+    // With a tab named, the wait happens on that tab: resolving it
+    // marks the tab as being worked (indicators, stop, cancel scope).
+    if (a.tabId != null || a.ref != null) await resolveTab(ctx, refTab(a));
+    await sleep(clamp(Number(a.duration) || 1, 0, 10) * 1000); return {};
+  }
   if (action === "screenshot") return shoot(ctx, a, null, "computer screenshot");
   if (action === "zoom") {
     if (!Array.isArray(a.region) || a.region.length !== 4) throw fail("bad_region", "[x0, y0, x1, y1]");
@@ -3049,7 +3504,7 @@ TOOLS.computer = async (ctx, a) => {
   // first bring their target into view with a visible, animated scroll, so
   // the point read afterwards is the rested on-screen position and the
   // user sees the page move before anything is pressed.
-  const POINTED = ["left_click", "right_click", "double_click", "triple_click", "hover", "scroll_to", "left_click_drag"];
+  const POINTED = ["left_click", "right_click", "double_click", "triple_click", "middle_click", "hover", "mouse_move", "scroll_to", "left_click_drag", "left_mouse_down", "left_mouse_up"];
   let x, y, backend = null, framedHit = null;
   if (a.ref != null) {
     const hit = refHit(a.ref);
@@ -3104,12 +3559,62 @@ TOOLS.computer = async (ctx, a) => {
       await audit(ctx.chat, action, P.describeTarget(d) + " @ " + host, "ok");
       return { clicked: P.describeTarget(d) };
     }
-    case "hover":
+    case "hover": case "mouse_move":
       if (x == null) throw fail("need_coordinate_or_ref");
       checkLive(ctx);
       await cursorGo(tab.id, x, y, false);
       await mouse(tab.id, "mouseMoved", x, y, { modifiers: mods });
       return {};
+    case "middle_click": {
+      if (x == null) throw fail("need_coordinate_or_ref");
+      const d = await gatedPress(ctx, tab, host, x, y, backend, "Click", 1,
+        async () => { await cursorGo(tab.id, x, y, true); await clickAt(tab.id, x, y, "middle", 1, mods); });
+      await audit(ctx.chat, action, P.describeTarget(d) + " @ " + host, "ok");
+      return { clicked: P.describeTarget(d) };
+    }
+    case "left_mouse_down": {
+      if (x == null) throw fail("need_coordinate_or_ref");
+      checkLive(ctx);
+      await cursorGo(tab.id, x, y, false);
+      await mouse(tab.id, "mousePressed", x, y, { button: "left", buttons: 1, clickCount: 1, modifiers: mods });
+      noteBridgeClick(tab.id, x, y);
+      return {};
+    }
+    case "left_mouse_up": {
+      if (x == null) throw fail("need_coordinate_or_ref");
+      checkLive(ctx);
+      await mouse(tab.id, "mouseReleased", x, y, { button: "left", buttons: 0, clickCount: 1, modifiers: mods });
+      return {};
+    }
+    case "cursor_position": {
+      const p = cursorPos.get(tab.id);
+      if (!p) throw fail("no_cursor_position", "the pointer has not been moved on this tab yet");
+      return { x: p.x, y: p.y };
+    }
+    case "hold_key": {
+      // A bare modifier name ("Shift", "ctrl") is itself a holdable
+      // key here, though parseKeys only accepts modifiers as chord
+      // prefixes.
+      const MOD_KEYS = { shift: ["Shift", "ShiftLeft", 16], ctrl: ["Control", "ControlLeft", 17],
+        control: ["Control", "ControlLeft", 17], alt: ["Alt", "AltLeft", 18],
+        meta: ["Meta", "MetaLeft", 91], cmd: ["Meta", "MetaLeft", 91] };
+      let keys;
+      try { keys = P.parseKeys(a.text); }
+      catch (e) {
+        const toks = String(a.text || "").trim().split(/\s+/).filter(Boolean);
+        if (!toks.length || !toks.every((t) => own(MOD_KEYS, t.toLowerCase()))) throw e;
+        keys = toks.map((t) => { const [key, code, vk] = MOD_KEYS[t.toLowerCase()]; return { key, code, vk, modifiers: 0, text: "" }; });
+      }
+      if (!keys.length) throw fail("bad_key", "hold_key needs a key or chord, e.g. \"Shift\" or \"ctrl+a\"");
+      const secs = clamp(Number(a.duration) || 1, 0.1, 10);
+      checkLive(ctx);
+      await ensureFocusEmulation(tab.id);
+      for (const k of keys) await keyDownOnly(tab.id, k);
+      await sleep(Math.round(secs * 1000));
+      for (const k of [...keys].reverse()) await keyUpOnly(tab.id, k);
+      await audit(ctx.chat, "hold_key", P.clip(a.text, 60) + ` (${secs}s) @ ` + host, "ok");
+      return { held: keys.map((k) => P.keyName(k)), seconds: secs };
+    }
     case "scroll": {
       const v = await viewport(tab.id);
       const px = x == null ? v.w / 2 : x, py = y == null ? v.h / 2 : y;
@@ -3214,7 +3719,13 @@ TOOLS.computer = async (ctx, a) => {
       }
       checkLive(ctx);
       await ensureFocusEmulation(tab.id);
-      await cdp(tab.id, "Input.insertText", { text });
+      // Blind path (focus inside a frame the probe cannot see): the
+      // text goes by Input.insertText, the channel the frame copy was
+      // built and proven on — it lands wherever the bridge's click put
+      // the browser's focus. Visible focus: real key events per
+      // character (typeText), as Claude's type() sends them.
+      if (blindAfterClick) await cdp(tab.id, "Input.insertText", { text });
+      else await typeText(tab.id, text);
       if (!blindAfterClick && text && f.isField && typeof f.len === "number") {
         const f3 = await focusInfo(tab, host).catch(() => null);
         if (f3 && f3.fp === f.fp && f3.len === f.len) {
@@ -3231,7 +3742,7 @@ TOOLS.computer = async (ctx, a) => {
       return { pressed: n };
     }
     default:
-      throw fail("unknown_action", "computer." + P.clip(action, 40) + ". Use one of: left_click, right_click, double_click, triple_click, left_click_drag, hover, scroll, scroll_to, type, key, screenshot, zoom, wait");
+      throw fail("unknown_action", "computer." + P.clip(action, 40) + ". Use one of: left_click, right_click, double_click, triple_click, middle_click, left_click_drag, left_mouse_down, left_mouse_up, hover, mouse_move, cursor_position, scroll, scroll_to, type, key, hold_key, screenshot, zoom, wait");
   }
 };
 
@@ -3479,6 +3990,371 @@ TOOLS.file_upload = async (ctx, a) => {
   return { uploaded: paths.length };
 };
 
+/* ---- v2.8 read / utility tools (FULL-GAP §5) ---------------------- */
+
+function patternMatcher(pattern) {
+  if (pattern == null || pattern === "") return null;
+  const p = String(pattern);
+  try { const re = new RegExp(p); return (s) => re.test(s); }
+  catch (e) { return (s) => s.includes(p); } // an invalid pattern matches as plain text, never crashes
+}
+
+TOOLS.read_console_messages = async (ctx, a) => {
+  const tab = await resolveTab(ctx, a.tabId != null ? Number(a.tabId) : undefined);
+  const b = consoleBuffers.get(tab.id);
+  let msgs = b ? b.messages.slice() : [];
+  if (a.errors_only || a.errorsOnly) msgs = msgs.filter((m) => m.type === "error" || m.type === "exception");
+  const match = patternMatcher(a.pattern);
+  if (match) msgs = msgs.filter((m) => match(m.text));
+  return { tabId: tab.id, messages: msgs.slice(-500) };
+};
+
+TOOLS.read_network_requests = async (ctx, a) => {
+  const tab = await resolveTab(ctx, a.tabId != null ? Number(a.tabId) : undefined);
+  const b = networkBuffers.get(tab.id);
+  let reqs = b ? [...b.requests.values()] : [];
+  const match = patternMatcher(a.url_pattern || a.urlPattern);
+  if (match) reqs = reqs.filter((r) => match(r.url));
+  return { tabId: tab.id, requests: reqs.slice(-500) };
+};
+
+TOOLS.resize_window = async (ctx, a) => {
+  const tab = await resolveTab(ctx, a.tabId != null ? Number(a.tabId) : undefined);
+  const w = Number(a.width), h = Number(a.height);
+  // Claude's bounds: positive numbers, at most 8K in each dimension.
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0 || w > 7680 || h > 4320)
+    throw fail("bad_size", "width and height must be positive numbers no larger than 7680x4320");
+  const width = Math.floor(w), height = Math.floor(h);
+  await chrome.windows.update(tab.windowId, { width, height });
+  await audit(ctx.chat, "resize_window", `${width}x${height}`, "ok");
+  return { tabId: tab.id, width, height };
+};
+
+/* upload_image: put an image onto the page — a file input through the
+ * file_upload machinery when a local path is given, or a drag-and-drop
+ * at a point / element when image bytes (a captured screenshot by id,
+ * or base64) are given. Mirrors Claude's two approaches. */
+TOOLS.upload_image = async (ctx, a) => {
+  // A local path goes through file_upload unchanged — including its
+  // credential-store refusal, which must fire before any ref lookup.
+  if (a.filePath || a.path) {
+    if (a.ref == null) throw fail("no_target", "upload_image with a file path needs the ref of a file input (or use file_upload)");
+    return TOOLS.file_upload(ctx, { paths: [String(a.filePath || a.path)], ref: a.ref });
+  }
+  const tab = await resolveTab(ctx, refTab(a));
+  let bytes = null, mime = "image/png";
+  if (a.imageId) {
+    const img = getImage(ctx.sessionId, String(a.imageId));
+    if (!img) throw fail("no_such_image", "no captured image with that id in this chat — take a screenshot first");
+    bytes = img.base64; mime = "image/" + img.format;
+  } else if (a.imageBase64) { bytes = String(a.imageBase64); if (a.mimeType) mime = String(a.mimeType); }
+  if (!bytes) throw fail("no_image", "give imageId (a screenshot from this chat), imageBase64, or filePath");
+  let x, y;
+  if (Array.isArray(a.coordinate)) { [x, y] = a.coordinate.map(Number); }
+  else if (a.ref != null) {
+    const hitU = refHit(a.ref);
+    if (typeof hitU.x !== "number" || typeof hitU.y !== "number")
+      throw fail("no_target", "that ref carries no point to drop on — pass a coordinate");
+    x = hitU.x; y = hitU.y;
+  } else throw fail("no_target", "give a ref or a coordinate to drop the image on");
+  await attach(tab.id);
+  await ensureFocusEmulation(tab.id).catch(() => {});
+  const data = [{ mimeType: mime, data: bytes }];
+  await cdp(tab.id, "Input.dispatchDragEvent", { type: "dragEnter", x, y, data: { items: data, dragOperationsMask: 1 } });
+  await cdp(tab.id, "Input.dispatchDragEvent", { type: "dragOver", x, y, data: { items: data, dragOperationsMask: 1 } });
+  await cdp(tab.id, "Input.dispatchDragEvent", { type: "drop", x, y, data: { items: data, dragOperationsMask: 1 } });
+  await audit(ctx.chat, "upload_image", `${mime} dropped at ${Math.round(x)},${Math.round(y)} @ ${P.hostOf(tab.url)}`, "ok");
+  return { uploaded: 1, via: "drop", tabId: tab.id };
+};
+
+/* update_plan: Claude shows the plan for approval and the listed
+ * domains become permitted for the session. Our v2.7.0 model has no
+ * per-plan prompt: the tab was already granted in full at share time,
+ * so the plan is RECORDED on the session (the panel shows it), and the
+ * listed domains join the session's permitted sites. */
+TOOLS.update_plan = async (ctx, a) => {
+  if (!Array.isArray(a.domains) || !Array.isArray(a.approach))
+    throw fail("bad_plan", "both 'domains' and 'approach' are required arrays");
+  const domains = a.domains.map(String).slice(0, 50);
+  const approach = a.approach.map(String).slice(0, 20);
+  await withState((st) => {
+    const s = st[ctx.sessionId];
+    if (!s) return;
+    s.plan = { domains, approach, at: Date.now() };
+    s.sites = s.sites || {};
+    for (const d of domains) { const h = P.hostOf(d.includes("://") ? d : "https://" + d); if (h) s.sites[h] = 1; }
+  });
+  await audit(ctx.chat, "update_plan", domains.join(", ") || "(no domains)", "ok");
+  return { recorded: true, domains };
+};
+
+/* javascript_tool: present in the tool surface for parity, DISABLED
+ * unless the user enables it in the panel. Daniel's standing rule for
+ * this bridge bars arbitrary page script; the default stays safe. */
+TOOLS.javascript_tool = async (ctx, a) => {
+  const enabled = await local.get("javascriptEnabled", false);
+  if (!enabled) throw fail("javascript_disabled",
+    "javascript_tool is disabled. It runs arbitrary code in the page, so it stays off unless the user enables it in the bridge panel.");
+  const code = String(a.text || a.code || "");
+  if (!code) throw fail("no_code", "give the code to run in 'text'");
+  const tab = await resolveTab(ctx, refTab(a));
+  await attach(tab.id);
+  const r = await cdp(tab.id, "Runtime.evaluate",
+    { expression: code, returnByValue: true, awaitPromise: true, userGesture: false }, 30000);
+  if (r && r.exceptionDetails) {
+    const ex = r.exceptionDetails.exception || {};
+    throw fail("javascript_error", P.clip(String(ex.description || ex.value || r.exceptionDetails.text || "evaluation failed"), 2000));
+  }
+  let out = "";
+  const res = (r && r.result) || {};
+  if (res.value !== undefined) out = typeof res.value === "string" ? res.value : JSON.stringify(res.value, null, 2) || String(res.value);
+  else if (res.description) out = String(res.description);
+  if (out.length > 51200) out = out.substring(0, 51200) + "\n[OUTPUT TRUNCATED: Exceeded 50KB limit]";
+  await audit(ctx.chat, "javascript_tool", P.clip(code, 120) + " @ " + P.hostOf(tab.url), "ok");
+  return { output: out, tabId: tab.id };
+};
+
+/* ---- saved prompts store (FULL-GAP §6; panel + alarms in stage H) - */
+const PROMPTS_KEY = "savedPrompts";
+async function getSavedPrompts() {
+  const v = await local.get(PROMPTS_KEY, []);
+  return Array.isArray(v) ? v : [];
+}
+async function setSavedPrompts(list) { await local.set(PROMPTS_KEY, list); }
+function promptByIdOrCommand(list, a) {
+  if (a.shortcutId || a.id) return list.find((p) => p.id === String(a.shortcutId || a.id)) || null;
+  if (a.command) { const c = String(a.command).replace(/^\//, ""); return list.find((p) => p.command === c) || null; }
+  return null;
+}
+
+TOOLS.shortcuts_list = async (ctx, a) => {
+  const list = await getSavedPrompts();
+  return { shortcuts: list.map((p) => ({ id: p.id, name: p.name, command: p.command,
+    repeatType: p.repeatType || "none", usageCount: p.usageCount || 0, lastUsedAt: p.lastUsedAt || null })) };
+};
+
+/* shortcuts_execute: Claude runs the saved prompt in its in-panel
+ * chat. Ours has no in-browser agent — the chats are external — so
+ * executing hands the full prompt text back to the calling chat,
+ * which is the run. Usage is recorded the same way. */
+TOOLS.shortcuts_execute = async (ctx, a) => {
+  const list = await getSavedPrompts();
+  const p = promptByIdOrCommand(list, a);
+  if (!p) throw fail("no_such_shortcut", "no saved prompt with that id or command — shortcuts_list shows what exists");
+  p.usageCount = (p.usageCount || 0) + 1;
+  p.lastUsedAt = Date.now();
+  await setSavedPrompts(list);
+  await audit(ctx.chat, "shortcuts_execute", "/" + p.command, "ok");
+  return { id: p.id, name: p.name, command: p.command, prompt: p.prompt, url: p.url || null };
+};
+
+/* ---- saved prompts: schedules + runs (v2.8, FULL-GAP §6) ----------
+ * Their SavedPromptsService semantics, adapted to our model: prompts
+ * live locally; a schedule is a one-shot chrome.alarms alarm named by
+ * the prompt id, recomputed after every fire/save/start; editing the
+ * prompt TEXT revokes its approval, so the next run first re-asks
+ * the ONE full-control confirmation (never a per-action prompt).
+ * Their runs execute in an in-panel account chat; ours has no
+ * in-browser agent, so a run opens its own window, starts a pairing
+ * for its tab, and waits in the panel with the code and the prompt
+ * text — the hand-off is the run. */
+function textHash(s) {
+  let h = 0x811c9dc5;
+  const str = String(s || "");
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return "h" + h.toString(16);
+}
+function nextRunFor(p, now) {
+  const parts = String(p.specificTime || "09:00").split(":").map((x) => parseInt(x, 10));
+  const H = Number.isFinite(parts[0]) ? parts[0] : 9, M = Number.isFinite(parts[1]) ? parts[1] : 0;
+  const DAY = 86400000;
+  switch (p.repeatType) {
+    case "once": {
+      if (!p.specificDate) return null;
+      const d = new Date(p.specificDate + "T00:00:00");
+      if (isNaN(d)) return null;
+      d.setHours(H, M, 0, 0);
+      return d.getTime() > now ? d.getTime() : null;
+    }
+    case "daily": {
+      const d = new Date(now); d.setHours(H, M, 0, 0);
+      if (d.getTime() <= now) d.setTime(d.getTime() + DAY);
+      return d.getTime();
+    }
+    case "weekly": {
+      const want = Math.min(6, Math.max(0, parseInt(p.dayOfWeek, 10) || 0));
+      const d = new Date(now); d.setHours(H, M, 0, 0);
+      for (let i = 0; i < 8; i++) { if (d.getDay() === want && d.getTime() > now) return d.getTime(); d.setTime(d.getTime() + DAY); }
+      return null;
+    }
+    case "monthly": {
+      const want = Math.min(31, Math.max(1, parseInt(p.dayOfMonth, 10) || 1));
+      for (let add = 0; add < 3; add++) {
+        const d = new Date(now); d.setDate(1); d.setMonth(d.getMonth() + add);
+        const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+        d.setDate(Math.min(want, last)); d.setHours(H, M, 0, 0);
+        if (d.getTime() > now) return d.getTime();
+      }
+      return null;
+    }
+    case "annually": {
+      const md = String(p.monthAndDay || "01-01").split("-").map((x) => parseInt(x, 10));
+      const mo = Math.min(11, Math.max(0, (md[0] || 1) - 1)), da = Math.min(31, Math.max(1, md[1] || 1));
+      for (let add = 0; add < 3; add++) {
+        const y = new Date(now).getFullYear() + add;
+        const last = new Date(y, mo + 1, 0).getDate();
+        const d = new Date(y, mo, Math.min(da, last), H, M, 0, 0);
+        if (d.getTime() > now) return d.getTime();
+      }
+      return null;
+    }
+    default: return null;
+  }
+}
+async function syncPromptAlarm(p) {
+  try { await chrome.alarms.clear(p.id); } catch (e) {}
+  const when = nextRunFor(p, Date.now());
+  if (when) { try { chrome.alarms.create(p.id, { when }); } catch (e) {} }
+}
+async function syncAllAlarms() {
+  for (const p of await getSavedPrompts()) await syncPromptAlarm(p);
+}
+async function recordRun(run) {
+  const runs = await local.get("promptRuns", []);
+  runs.push(run);
+  await local.set("promptRuns", runs.slice(-50));
+}
+async function runScheduledPrompt(p) {
+  await syncPromptAlarm(p); // reschedule first, as theirs does
+  const run = { id: "run_" + Date.now(), promptId: p.id, name: p.name, at: Date.now(), status: "" };
+  if (textHash(p.prompt) !== p.approvedTextHash) {
+    let ok = false;
+    try {
+      await ask({ sessionId: "schedule:" + p.id, chat: "Scheduled · " + p.name, tabId: null, job: null },
+        `Run the scheduled prompt "${p.name}"?`,
+        "Its text changed since it was last approved. Allowing runs it as written now: it opens its own window and prepares a tab to hand to a chat, with the same full control a shared tab carries.",
+        p.url || "", { ms: SHARE_CONFIRM_MS });
+      ok = true;
+    } catch (e) { ok = false; }
+    if (!ok) {
+      run.status = "skipped — the changed prompt was not confirmed";
+      await recordRun(run);
+      await audit("Scheduled · " + p.name, "scheduled run", "/" + p.command, "skipped: changed prompt not confirmed");
+      notifyPanel();
+      return run;
+    }
+    const list = await getSavedPrompts();
+    const cur = list.find((x) => x.id === p.id);
+    if (cur) { cur.approvedTextHash = textHash(cur.prompt); await setSavedPrompts(list); }
+  }
+  try {
+    const win = await chrome.windows.create({ url: p.url || "about:blank", focused: false });
+    const tab = win && win.tabs && win.tabs[0];
+    if (!tab) throw new Error("the new window has no tab");
+    run.tabId = tab.id;
+    if (p.url) {
+      const reqId = await startShare(tab.id);
+      await withShares((shares) => { if (shares[reqId]) shares[reqId].runId = run.id; });
+      run.reqId = reqId;
+      run.status = "awaiting chat — pair with the code in the panel";
+    } else {
+      run.status = "window opened — share a page in it from the panel to hand it to a chat";
+    }
+  } catch (e) {
+    run.status = "failed — " + P.clip(String((e && e.message) || e), 120);
+  }
+  await recordRun(run);
+  await audit("Scheduled · " + p.name, "scheduled run", "/" + p.command, run.status);
+  notifyPanel();
+  return run;
+}
+
+/* ---- GIF recording (v2.8, FULL-GAP §7) ------------------------------
+ * Per chat: while recording, the framed actions leave a frame each
+ * (captured like a screenshot, indicators hidden), capped at 50 as
+ * theirs is. Export encodes in the offscreen document with the
+ * overlay drawing there; the result returns to the calling chat as a
+ * data URL (and is kept as the chat's lastGif). */
+const GIF_MAX_FRAMES = 50;
+const gifSessions = new Map(); // sessionId -> {recording, frames: [], lastGif}
+function gifState(sessionId) {
+  let g = gifSessions.get(sessionId);
+  if (!g) { g = { recording: false, frames: [], lastGif: null }; gifSessions.set(sessionId, g); }
+  return g;
+}
+async function captureGifFrame(sessionId, tabId, msg) {
+  const g = gifState(sessionId);
+  if (g.frames.length >= GIF_MAX_FRAMES) { g.recording = false; return; }
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return;
+  await attach(tabId);
+  if (!tab.active) await forceTabDraw(tab);
+  await hideIndicatorsForCapture(tabId);
+  try {
+    const r = await cdp(tabId, "Page.captureScreenshot", { format: "jpeg", quality: 70, fromSurface: true }, 6000);
+    if (!r || !r.data) return;
+    const a = (msg && msg.args) || {};
+    const inner = a.action ? String(a.action) : (msg.action || "");
+    g.frames.push({ base64: r.data, format: "jpeg",
+      action: { type: inner || msg.action, coordinate: Array.isArray(a.coordinate) ? a.coordinate : null,
+        start_coordinate: Array.isArray(a.start_coordinate) ? a.start_coordinate : null,
+        description: inner ? inner.replace(/_/g, " ") : msg.action } });
+  } finally {
+    await showIndicatorsAfterCapture(tabId);
+  }
+}
+async function generateGifViaOffscreen(frames) {
+  if (chrome.offscreen && chrome.offscreen.createDocument) {
+    const has = chrome.offscreen.hasDocument ? await chrome.offscreen.hasDocument().catch(() => false) : false;
+    if (!has) await chrome.offscreen.createDocument({ url: "offscreen.html", reasons: ["BLOBS"], justification: "Encode recorded GIF frames" }).catch(() => {});
+  }
+  const reply = await chrome.runtime.sendMessage({ kind: "GENERATE_GIF", frames, delay: 800 });
+  if (!reply || !reply.ok) throw fail("gif_failed", (reply && reply.error) || "the offscreen encoder did not answer");
+  return reply;
+}
+
+TOOLS.gif_creator = async (ctx, a) => {
+  const g = gifState(ctx.sessionId);
+  const action = String(a.action || "");
+  const tabFor = async () => {
+    if (a.tabId != null) return await resolveTab(ctx, Number(a.tabId));
+    const tabs = await sessionTabs(ctx.sessionId);
+    const t = tabs.find((x) => x.id === ctx.lastTab) || tabs.find((x) => x.active) || tabs[0];
+    if (!t) throw fail("no_tabs", "this chat has no tabs to record");
+    return t;
+  };
+  switch (action) {
+    case "start_recording": {
+      g.frames = [];
+      g.recording = true;
+      const tab = await tabFor().catch(() => null);
+      if (tab) await captureGifFrame(ctx.sessionId, tab.id, { action: "navigate", args: {} }).catch(() => {});
+      await audit(ctx.chat, "gif_creator", "recording started", "ok");
+      return { recording: true, frames: g.frames.length };
+    }
+    case "stop_recording": {
+      const tab = await tabFor().catch(() => null);
+      if (tab && g.recording) await captureGifFrame(ctx.sessionId, tab.id, { action: "screenshot", args: {} }).catch(() => {});
+      g.recording = false;
+      await audit(ctx.chat, "gif_creator", "recording stopped at " + g.frames.length + " frames", "ok");
+      return { recording: false, frames: g.frames.length };
+    }
+    case "export": {
+      if (!g.frames.length) throw fail("no_frames", "nothing recorded — start_recording first");
+      const reply = await generateGifViaOffscreen(g.frames);
+      g.lastGif = reply.gif;
+      await audit(ctx.chat, "gif_creator", "exported " + g.frames.length + " frames", "ok");
+      return { gif: reply.gif, frames: g.frames.length, width: reply.width, height: reply.height };
+    }
+    case "clear": {
+      g.frames = []; g.recording = false;
+      return { recording: false, frames: 0 };
+    }
+    default:
+      throw fail("unknown_action", "gif_creator actions: start_recording, stop_recording, export, clear");
+  }
+};
+
 TOOLS.browser_batch = async (ctx, a) => {
   const actions = Array.isArray(a.actions) ? a.actions : [];
   if (actions.length > 50) throw fail("bad_request", "at most 50 actions per batch");
@@ -3607,6 +4483,87 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     }, () => respond({ ok: false }));
     return true;
   }
+  // The agent layer in a shared tab (agent-ui.js): its Stop button,
+  // its static pill, and the pill's heartbeat. Same sender discipline
+  // as the pill: our own extension, top frame, a real tab.
+  if (msg && sender && sender.id === chrome.runtime.id && sender.tab && sender.frameId === 0 &&
+      ["agent_stop", "agent_stop_dropped", "agent_open_chat", "agent_dismiss_static", "agent_heartbeat"].includes(msg.kind)) {
+    (async () => {
+      const tabId = sender.tab.id;
+      const sid = await ownerOf(tabId);
+      if (msg.kind === "agent_heartbeat") {
+        respond({ active: !!sid && !(await staticDismissed(sid, tabId)) });
+        return;
+      }
+      if (!sid) { respond({ ok: false }); return; }
+      const s = (await getSessions())[sid];
+      const chat = s ? s.chatName : sid;
+      if (msg.kind === "agent_stop") {
+        cancelTabWork(tabId, null);
+        // Stop means this chat's in-flight work, including a command
+        // that holds no tab (a wait): cancel its jobs directly too.
+        for (const job of inflight.values()) if (job.sessionId === sid) { job.canceled = true; job.canceledByTab = true; }
+        await audit(chat, "stopped from the page", P.hostOf(sender.tab.url || ""), "ok");
+        // Immediate visual answer: the working layer comes down now;
+        // jobFinished re-renders the steady state when results land.
+        await agentUI(tabId, { working: false, static: !(await staticDismissed(sid, tabId)) });
+        refreshGroupPrefix(sid).catch(() => {});
+        notifyPanel();
+      } else if (msg.kind === "agent_stop_dropped") {
+        await audit(chat, "stop from the page did not land", P.hostOf(sender.tab.url || ""), "dropped");
+      } else if (msg.kind === "agent_open_chat") {
+        if (chrome.sidePanel && chrome.sidePanel.open) await chrome.sidePanel.open({ windowId: sender.tab.windowId }).catch(() => {});
+      } else if (msg.kind === "agent_dismiss_static") {
+        const d = await sess.get("staticDismissed", {});
+        d[sid + ":" + tabId] = 1;
+        await sess.set("staticDismissed", d);
+        await agentUI(tabId, { static: false });
+      }
+      respond({ ok: true });
+    })().catch(() => respond({ ok: false }));
+    return true;
+  }
+  // Panel helpers driven from page content (v2.8, FULL-GAP §12): the
+  // workflow recorder's steps and the element picker's result. Same
+  // sender discipline: our extension, top frame, a real tab — and a
+  // step is accepted only from the tab being recorded, a pick only
+  // from the tab being picked.
+  if (msg && sender && sender.id === chrome.runtime.id && sender.tab && sender.frameId === 0 &&
+      ["wf_step", "pick_result", "pick_cancel"].includes(msg.kind)) {
+    (async () => {
+      const tabId = sender.tab.id;
+      if (msg.kind === "wf_step") {
+        const rec = await sess.get("wfRecording", null);
+        if (!rec || rec.tabId !== tabId || !msg.step) { respond({ ok: false }); return; }
+        rec.steps = rec.steps || [];
+        if (rec.steps.length < 200) {
+          const step = { kind: String(msg.step.kind || ""), desc: P.clip(String(msg.step.desc || ""), 200),
+                         url: String(msg.step.url || ""), at: Date.now() };
+          if (sender.tab.active) {
+            step.shot = await chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: "jpeg", quality: 40 }).catch(() => null);
+          }
+          rec.steps.push(step);
+          await sess.set("wfRecording", rec);
+        }
+        notifyPanel();
+        respond({ ok: true });
+        return;
+      }
+      if (msg.kind === "pick_result") {
+        const picking = await sess.get("picking", null);
+        if (!picking || picking.tabId !== tabId) { respond({ ok: false }); return; }
+        await sess.set("lastPick", { ...(msg.pick || {}), at: Date.now() });
+        await sess.set("picking", null);
+        notifyPanel();
+        respond({ ok: true });
+        return;
+      }
+      await sess.set("picking", null); // pick_cancel
+      notifyPanel();
+      respond({ ok: true });
+    })().catch(() => respond({ ok: false }));
+    return true;
+  }
   if (!fromOurPage(sender) || !msg || typeof msg !== "object") { respond({ ok: false, error: "forbidden" }); return false; }
   (async () => {
     switch (msg.kind) {
@@ -3648,7 +4605,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
           for (const t of tids) {
             if (t.groupId == null || t.groupId === -1 || ownGroup.has(t.groupId)) continue;
             const g = await chrome.tabGroups.get(t.groupId).catch(() => null);
-            ownGroup.set(t.groupId, !!(g && g.title === title));
+            ownGroup.set(t.groupId, !!(g && sameGroupTitle(g.title, title)));
           }
           const grouped = tids.length > 0 && tids.every((t) => t.groupId != null && t.groupId !== -1 && ownGroup.get(t.groupId));
           const groupStopped = tids.some((t) => (t.groupId == null || t.groupId === -1)
@@ -3658,6 +4615,8 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
             groupError: s.groupError ? String(s.groupError.text || "") : "",
             groupWindowType: s.groupError ? String(s.groupError.windowType || "") : "",
             groupStopped,
+            plan: s.plan ? { domains: s.plan.domains, approach: s.plan.approach, at: s.plan.at } : null,
+            orphans: await findOrphanedTabs(sid),
             view: view ? { tabId: view.tabId, at: view.at, image: view.image || null, blocked: view.blocked || null } : null });
         }
         return { ok: true, relay: { connected: wsReady, url: DEFAULT_RELAY, error: await local.get("relayError", ""),
@@ -3666,6 +4625,14 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                  share: share ? { reqId: share[0], code: share[1].code, expires: share[1].expires,
                                   stalled: !share[1].code && Date.now() - (share[1].created || 0) > 10000 } : null,
                  chats, prompts: [...pending].map(([id, p]) => ({ id, chat: p.chat, title: p.title, detail: p.detail, url: p.url, created: p.created, expiresAt: p.expiresAt })),
+                 savedPrompts: await getSavedPrompts(),
+                 promptRuns: (await local.get("promptRuns", [])).slice(-5).reverse().map((r) => ({
+                   ...r, code: (Object.values(shares).find((s) => s.runId === r.id) || {}).code || null })),
+                 javascriptEnabled: !!(await local.get("javascriptEnabled", false)),
+                 recording: await (async () => { const r = await sess.get("wfRecording", null);
+                   return r ? { active: true, tabId: r.tabId, steps: (r.steps || []).length, startedAt: r.startedAt } : { active: false }; })(),
+                 lastPick: await sess.get("lastPick", null),
+                 picking: !!(await sess.get("picking", null)),
                  audit: (await local.get("audit", [])).slice(-40).reverse() };
       }
       case "share": return { ok: true, reqId: await startShare(Number(msg.tabId)) };
@@ -3677,6 +4644,115 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         return { ok: true };
       }
       case "start_relay": return await startRelay(true);
+      case "wf_start": {
+        const tab = await chrome.tabs.get(Number(msg.tabId)).catch(() => null);
+        if (!tab) return { ok: false, error: "no_tab" };
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["recorder.js"] });
+        await sess.set("wfRecording", { tabId: tab.id, startedAt: Date.now(), steps: [] });
+        await audit("panel", "workflow recording", P.hostOf(tab.url || ""), "started");
+        notifyPanel();
+        return { ok: true };
+      }
+      case "wf_stop": {
+        const rec = await sess.get("wfRecording", null);
+        await sess.set("wfRecording", null);
+        if (!rec || !(rec.steps || []).length) return { ok: true, steps: 0 };
+        const lines = rec.steps.map((s, i) => `${i + 1}. ${s.desc}${s.url ? " — " + s.url : ""}`);
+        const list = await getSavedPrompts();
+        let command = "workflow", n = 2;
+        while (list.some((p) => p.command === command)) command = "workflow-" + (n++);
+        const rec2 = { id: "prompt_" + Date.now(), name: "Recorded workflow", prompt: lines.join("\n"),
+          command, createdAt: Date.now(), usageCount: 0, lastUsedAt: null,
+          url: rec.steps[0].url || null, repeatType: "none" };
+        list.push(rec2);
+        await setSavedPrompts(list);
+        await audit("panel", "workflow recording", rec.steps.length + " steps", "saved as /" + command);
+        notifyPanel();
+        return { ok: true, steps: rec.steps.length, promptId: rec2.id };
+      }
+      case "prompt_save": {
+        const name = P.clip(String(msg.name || ""), 80).trim();
+        const text = String(msg.prompt || "");
+        if (!name || !text.trim()) return { ok: false, error: "name_and_prompt_required" };
+        let command = String(msg.command || "").trim().replace(/^\//, "").toLowerCase().replace(/\s+/g, "-");
+        if (!command) command = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "prompt";
+        const list = await getSavedPrompts();
+        if (list.some((p) => p.command === command)) return { ok: false, error: "command_taken", detail: "/" + command + " is already in use" };
+        const p = { id: "prompt_" + Date.now(), name, prompt: text, command, createdAt: Date.now(), usageCount: 0, lastUsedAt: null,
+          url: msg.url ? String(msg.url) : null, repeatType: String(msg.repeatType || "none"),
+          specificTime: msg.specificTime || "09:00", specificDate: msg.specificDate || null,
+          dayOfWeek: msg.dayOfWeek != null ? Number(msg.dayOfWeek) : null,
+          dayOfMonth: msg.dayOfMonth != null ? Number(msg.dayOfMonth) : null,
+          monthAndDay: msg.monthAndDay || null, approvedTextHash: textHash(text) };
+        list.push(p);
+        await setSavedPrompts(list);
+        await syncPromptAlarm(p);
+        notifyPanel();
+        return { ok: true, id: p.id };
+      }
+      case "prompt_update": {
+        const list = await getSavedPrompts();
+        const p = list.find((x) => x.id === String(msg.id));
+        if (!p) return { ok: false, error: "no_such_prompt" };
+        if (msg.command !== undefined) {
+          const c = String(msg.command || "").trim().replace(/^\//, "").toLowerCase().replace(/\s+/g, "-");
+          if (c && c !== p.command && list.some((x) => x.command === c))
+            return { ok: false, error: "command_taken", detail: "/" + c + " is already in use" };
+          if (c) p.command = c;
+        }
+        for (const k of ["name", "prompt", "url", "repeatType", "specificTime", "specificDate", "dayOfWeek", "dayOfMonth", "monthAndDay"])
+          if (msg[k] !== undefined) p[k] = (k === "dayOfWeek" || k === "dayOfMonth") && msg[k] != null ? Number(msg[k]) : msg[k];
+        // A text change is deliberately NOT re-approved here: the
+        // stored approval hash stops matching, so the next scheduled
+        // run re-asks the one confirmation (their revoke-on-edit).
+        await setSavedPrompts(list);
+        await syncPromptAlarm(p);
+        notifyPanel();
+        return { ok: true };
+      }
+      case "prompt_delete": {
+        const list = await getSavedPrompts();
+        const p = list.find((x) => x.id === String(msg.id));
+        if (!p) return { ok: false, error: "no_such_prompt" };
+        await setSavedPrompts(list.filter((x) => x.id !== p.id));
+        try { await chrome.alarms.clear(p.id); } catch (e) {}
+        notifyPanel();
+        return { ok: true };
+      }
+      case "prompt_run_now": {
+        const p = (await getSavedPrompts()).find((x) => x.id === String(msg.id));
+        if (!p) return { ok: false, error: "no_such_prompt" };
+        const run = await runScheduledPrompt(p);
+        return { ok: true, run };
+      }
+      case "pick_start": {
+        const tab = await chrome.tabs.get(Number(msg.tabId)).catch(() => null);
+        if (!tab) return { ok: false, error: "no_tab" };
+        await sess.set("picking", { tabId: tab.id, at: Date.now() });
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["picker.js"] });
+        notifyPanel();
+        return { ok: true };
+      }
+      case "set_javascript_enabled": {
+        await local.set("javascriptEnabled", !!msg.enabled);
+        await audit("panel", "javascript_tool", msg.enabled ? "enabled in the panel" : "disabled in the panel", "ok");
+        notifyPanel();
+        return { ok: true };
+      }
+      case "debug_export": {
+        const sessions = await getSessions();
+        const out = { version: VERSION, exportedAt: new Date().toISOString(),
+          sessions: [], pendingPrompts: [...pending].map(([, p]) => ({ chat: p.chat, title: p.title })),
+          audit: (await local.get("audit", [])).slice(-100),
+          settings: { javascriptEnabled: !!(await local.get("javascriptEnabled", false)) },
+          savedPrompts: (await getSavedPrompts()).length };
+        for (const [sid, s] of Object.entries(sessions)) {
+          const tids = await sessionTabs(sid);
+          out.sessions.push({ chatName: s.chatName, sites: Object.keys(s.sites || {}),
+            tabs: tids.map((t) => ({ host: P.hostOf(t.url || ""), title: t.title || "" })) });
+        }
+        return { ok: true, export: out };
+      }
       case "cancel_share":
         await withShares((shares) => { delete shares[msg.reqId]; });
         relaySend({ t: "pair_cancel", reqIds: [String(msg.reqId)] });
@@ -3733,11 +4809,29 @@ async function sweepIdle() {
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "mbb-keepalive") { if (!ws) connect(); }
   if (a.name === "mbb-idle") sweepIdle();
+  if (typeof a.name === "string" && a.name.startsWith("prompt_")) {
+    (async () => {
+      const p = (await getSavedPrompts()).find((x) => x.id === a.name);
+      if (p) await runScheduledPrompt(p);
+    })().catch(() => {});
+  }
 });
 // A new worker starts with nothing in memory: clear what the old one left
 // on screen (badge, prompt notifications) and any debugger sessions it had.
 async function cleanupAfterRestart() {
   chrome.action.setBadgeText({ text: "" }).catch(() => {});
+  syncAllAlarms().catch(() => {}); // saved-prompt schedules re-arm after a restart
+  // Un-mute any tab the previous worker muted for focus emulation
+  // (Claude's startup sweep): the stored list is ours alone, and a tab
+  // we muted must not stay muted because the worker restarted.
+  try {
+    const muted = await sess.get("emuMuted", []);
+    for (const id of Array.isArray(muted) ? muted : []) {
+      emuMuted.delete(id);
+      await chrome.tabs.update(Number(id), { muted: false }).catch(() => {});
+    }
+    await sess.set("emuMuted", []);
+  } catch (e) {}
   try {
     const all = await chrome.notifications.getAll();
     for (const id of Object.keys(all || {})) if (id.startsWith("mbb-")) chrome.notifications.clear(id).catch(() => {});
