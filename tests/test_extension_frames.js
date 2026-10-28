@@ -46,12 +46,22 @@ async function waitPrompt(n = 1) {
   for (let i = 0; i < 200; i++) { const p = await pendingPrompts(); if (p.length >= n) return p; await tick(5); }
   return [];
 }
+// v2.7: a share lands only on the ONE full-control confirmation.
+async function approveShare() {
+  for (let i = 0; i < 200; i++) {
+    const sp = (await pendingPrompts()).find((p) => /full control/i.test(p.title));
+    if (sp) { await panel("approve", { id: sp.id }); return sp; }
+    await tick(5);
+  }
+  return null;
+}
 async function pair(tabId, sid, name) {
   await panel("share", { tabId });
   const req = sent.filter((m) => m.t === "pair_request").pop();
   FakeWS.last.deliver({ t: "pair_code", reqId: req.reqId, code: "ABCD2345", expiresIn: 300 });
   await tick(10);
   FakeWS.last.deliver({ t: "paired", reqId: req.reqId, sessionId: sid, chatName: name });
+  await approveShare();
   await tick(30);
 }
 const mouseEvts = (tabId) => inputs.filter((i) => i.tabId === tabId && i.method === "Input.dispatchMouseEvent");
@@ -191,15 +201,14 @@ const childDoc = { defaultView: { frameElement: frameEl } };
     { nodeName: "DIV", children: [], shadowRoots: [
       { nodeName: "#shadow-root", children: [
         { nodeName: "INPUT", attributes: ["type", "password"] } ] } ] } ] });
-  const shotP = cmdStart("sess-A", "screenshot", { tabId: T });
-  const pr = await waitPrompt(1);
-  check("a password field inside a closed shadow root makes the screenshot ask (DOM.getDocument scan)",
-        pr.length === 1 && /Screenshot a page with a password field/.test(pr[0].title), pr);
+  r = await cmd("sess-A", "screenshot", { tabId: T });
+  check("a password field inside a closed shadow root no longer makes the screenshot ask (v2.7: recorded, not asked)",
+        r.ok && /^data:image\//.test((r.data && r.data.image) || "") && (await pendingPrompts()).length === 0, r);
   check("...and DOM.getDocument actually went through the CDP dispatcher",
         cdpLog.some((c) => c.tabId === T && c.method === "DOM.getDocument"), null);
-  if (pr.length) await panel("approve", { id: pr[0].id });
-  r = await result(shotP);
-  check("the approved screenshot is taken", r.ok && /^data:image\//.test((r.data && r.data.image) || ""), r);
+  const shotEv = (await panel("state")).audit.filter((a) => /Screenshot a page with a password field/.test(a.action));
+  check("...and the sensitive capture is written to the event record instead",
+        shotEv.length === 1 && shotEv[0].outcome === "no prompt: full control", shotEv);
   page.domTree = null;
 
   console.log(`\n${passes}/${passes + failures} passed`);
