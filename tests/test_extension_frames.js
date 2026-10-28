@@ -154,15 +154,21 @@ const childDoc = { defaultView: { frameElement: frameEl } };
         r.ok && emuEvts(T).filter((c) => c.params.enabled === true).length === 2, emuEvts(T));
 
   /* ---- 4. type after a bridge click lands in the framed field ------- */
+  // v2.8: with the framed field visible to the probe as the focus, type
+  // goes by real key events per character (Claude's type()); the field
+  // grows by the delivered key text exactly as it grew by insertText.
+  const delivered = (tabId) => inputs.filter((i) => i.tabId === tabId &&
+    (i.method === "Input.insertText" || (i.method === "Input.dispatchKeyEvent" && i.params.type !== "keyUp")))
+    .map((i) => i.params.text || "").join("");
   page.point = () => ({ tag: "input", type: "text", isField: true, fp: "input|msg" });
   page.focus = () => ({ kind: "element", tag: "input", isField: true, fp: "input|msg",
-                        len: inserted(T).reduce((n, i) => n + i.params.text.length, 0) });
+                        len: delivered(T).length });
   r = await cmd("sess-A", "computer", { action: "left_click", ref: fldRef });
   check("clicking the framed field succeeds", r.ok, r);
-  const ins0 = inserted(T).length;
+  const del0 = delivered(T).length, ins0 = inserted(T).length;
   r = await cmd("sess-A", "computer", { action: "type", text: "hello", tabId: T });
   check("type after the bridge's click lands in the framed field (no human pre-click, no not_typed)",
-        r.ok && inserted(T).length === ins0 + 1 && inserted(T)[ins0].params.text === "hello", r);
+        r.ok && delivered(T).slice(del0) === "hello" && inserted(T).length === ins0, r);
 
   /* ---- 5. probe-blind focus after a bridge click; honest error else - */
   page.focus = () => ({ kind: "none", fp: "none" });
