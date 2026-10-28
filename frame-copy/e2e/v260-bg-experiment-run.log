@@ -1,0 +1,145 @@
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822, 8971, 8972]); waiting for them to free up...
+ports busy ([19822, 20822]); waiting for them to free up...
+rig tmp dir: /tmp/frame-rig-yfmqmduy
+extension under test: /home/hatch/workspace/muse-browser-bridge/attach-on-redeem/extension
+origins up: A=http://frame-a.test:8971 B=http://frame-b.test:8972
+relay up (enroll-secret gated)
+chromium up
+extension loaded: id=kakpicabljpbdbhjokkldmlkdbgcehoj url=chrome-extension://kakpicabljpbdbhjokkldmlkdbgcehoj/sw.js
+parent page loaded
+enroll secret provisioned into extension storage: set
+parent chrome tab id=1111560199 window id=1111560197
+extension connected to relay: {'connected': True, 'url': 'ws://127.0.0.1:19822', 'error': '', 'startError': '10:28:54 AM Specified native messaging host not found.'}
+share requested: {'ok': True, 'reqId': 'ad4a984b-776e-4a5c-8604-894c8e9bc4c3'}
+pairing code obtained: UYBWQ38S
+  client pair UYBWQ38S --chat Frame Rig -> exit 0: {"ok": true, "chat": "Frame Rig", "sessionId": "36145cc9c8af18bd78e50bb5", "tokenFile": "/tmp/frame-rig-yfmqmduy/chat/.muse-bridge-token"}
+chat paired as None session 36145cc9c8af18bd78e50bb5
+panel prompt pump running (auto-approves permission prompts, logging each)
+  client tabs_context {} -> exit 0: {"ok": true, "data": {"chat": "Frame Rig", "tabs": [{"tabId": 1111560199, "title": "Frame Rig Parent", "url": "http://frame-a.test:8971/parent.html", "active": true}], "permittedSites": ["frame-a.test:8971"]}, "pageContent": "untrusted"}
+harness reads the framed page via: oopif target
+iframe rect in parent viewport: {'x': 12, 'y': 236.875, 'w': 780, 'h': 470}
+
+CASE framed-contenteditable: click composer, type, click Send, read list back
+  composer viewport point: [402, 508]
+  [panel] APPROVED prompt: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.' -> {'ok': True}
+  client computer {"action": "left_click", "tabId": 1111560199, "coordinate": [402, 508]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  [panel] APPROVED prompt: 'Type where Muse cannot see the field' -- '(18 characters, hidden) into element (in a frame from frame-b.test:8972) on frame-a.test:8971. The typing goes into a frame from frame-b.test:8972. Muse cannot see if it is a password field.' -> {'ok': True}
+  client computer {"action": "type", "tabId": 1111560199, "text": "alpha-composer-123"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  frame truth after typing: {'messages': [], 'note': '', 'composer': 'alpha-composer-123'}
+  send button viewport point: [58, 644]
+  [panel] APPROVED prompt: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.' -> {'ok': True}
+  client computer {"action": "left_click", "tabId": 1111560199, "coordinate": [58, 644]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1111560199} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG: alpha-composer-123\n
+  frame messages: ['alpha-composer-123']
+  in framed message list (ground truth): True; in bridge read-back of parent tab: True
+  => PASS framed-contenteditable
+
+CASE framed-textarea: click textarea, type, read value back
+  textarea viewport point: [235, 592]
+  [panel] APPROVED prompt: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.' -> {'ok': True}
+  client computer {"action": "left_click", "tabId": 1111560199, "coordinate": [235, 592]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  [panel] APPROVED prompt: 'Type where Muse cannot see the field' -- '(18 characters, hidden) into element (in a frame from frame-b.test:8972) on frame-a.test:8971. The typing goes into a frame from frame-b.test:8972. Muse cannot see if it is a password field.' -> {'ok': True}
+  client computer {"action": "type", "tabId": 1111560199, "text": "bravo-textarea-456"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1111560199} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG: alpha-composer-123\n
+  frame textarea value (ground truth): 'bravo-textarea-456'
+  value exact match: True; in bridge read-back: True
+  => PASS framed-textarea
+
+CASE parent-control: click control textarea, type, click Post, read list back
+  control textarea viewport point: [225, 141]
+  client computer {"action": "left_click", "tabId": 1111560199, "coordinate": [225, 141]} -> exit 0: {"ok": true, "data": {"clicked": "textbox \"Control message\""}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 1111560199, "text": "charlie-control-789"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  client computer {"action": "left_click", "tabId": 1111560199, "coordinate": [55, 186]} -> exit 0: {"ok": true, "data": {"clicked": "button \"Post control\""}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1111560199} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\ncharlie-control-789\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG:
+  parent control list (ground truth): ['charlie-control-789']
+  in control list: True; in bridge read-back: True
+  => PASS parent-control
+
+CASE ref-cross-composer: find the cross-origin framed composer by label, click its ref, type, click the Send ref
+  client find {"tabId": 1111560199, "query": "message composer"} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "matches": [{"ref": "ref_24", "role": "textbox", "name": "Message composer", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_12", "role": "StaticText", "name": "MESSAGES:\nMSG: alpha-composer-123\nNOTE: bravo-textarea-456\nCOMPOSER: "}, {"ref":
+  client find {"tabId": 1111560199, "query": "note textarea"} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "matches": [{"ref": "ref_12", "role": "StaticText", "name": "MESSAGES:\nMSG: alpha-composer-123\nNOTE: bravo-textarea-456\nCOMPOSER: "}, {"ref": "ref_25", "role": "textbox", "name": "Note", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_30", "
+  client find {"tabId": 1111560199, "query": "Send button"} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "matches": [{"ref": "ref_26", "role": "button", "name": "Send", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_31", "role": "button", "name": "Send", "frame": "http://frame-a.test:8971/chat.html"}, {"ref": "ref_10", "role": "button", "name": "
+  cross-origin refs: composer=ref_24 note=ref_25 send=ref_26
+  [panel] APPROVED prompt: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.' -> {'ok': True}
+  client computer {"action": "left_click", "tabId": 1111560199, "ref": "ref_24"} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  [panel] APPROVED prompt: 'Type where Muse cannot see the field' -- '(17 characters, hidden) into element (in a frame from frame-b.test:8972) on frame-a.test:8971. The typing goes into a frame from frame-b.test:8972. Muse cannot see if it is a password field.' -> {'ok': True}
+  client computer {"action": "type", "tabId": 1111560199, "text": "golf-refcross-333"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  frame truth after ref-click + type: {'messages': ['alpha-composer-123'], 'note': 'bravo-textarea-456', 'composer': 'golf-refcross-333'}
+  [panel] APPROVED prompt: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.' -> {'ok': True}
+  client computer {"action": "left_click", "tabId": 1111560199, "ref": "ref_26"} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1111560199} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\ncharlie-control-789\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG:
+  frame messages: ['alpha-composer-123', 'golf-refcross-333']
+  in framed message list (ground truth): True; in bridge read-back of parent tab: True
+  => PASS ref-cross-composer
+
+CASE ref-framed-textarea: form_input sets the cross-origin framed textarea by ref
+  client form_input {"tabId": 1111560199, "ref": "ref_25", "value": "echo-forminput-111"} -> exit 0: {"ok": true, "data": {"set": "textbox \"Note\" (in a frame from frame-b.test:8972)"}, "pageContent": "untrusted"}
+  frame textarea value (ground truth): 'echo-forminput-111' (wanted 'echo-forminput-111')
+  => PASS ref-framed-textarea
+
+CASE ref-sameorigin-composer: the same ref flow inside the same-origin frame
+  client find {"tabId": 1111560199, "query": "message composer"} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "matches": [{"ref": "ref_35", "role": "textbox", "name": "Message composer", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_32", "role": "StaticText", "name": "MESSAGES:\nMSG: alpha-composer-123\nMSG: golf-refcross-333\nNOTE: echo-forminput-11
+  client find {"tabId": 1111560199, "query": "Send button"} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "matches": [{"ref": "ref_37", "role": "button", "name": "Send", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_31", "role": "button", "name": "Send", "frame": "http://frame-a.test:8971/chat.html"}, {"ref": "ref_10", "role": "button", "name": "
+  same-origin refs: composer=ref_29 send=ref_31
+  client computer {"action": "left_click", "tabId": 1111560199, "ref": "ref_29"} -> exit 0: {"ok": true, "data": {"clicked": "div \"Message composer\" (in a frame from frame-a.test:8971)"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 1111560199, "text": "delta-sameorigin-000"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  same-origin frame truth after ref-click + type: {'messages': [], 'note': '', 'composer': 'delta-sameorigin-000'}
+  [panel] APPROVED prompt: 'Click' -- 'button "Send" (in a frame from frame-a.test:8971) on frame-a.test:8971. It may pay, send, order or delete something.' -> {'ok': True}
+  client computer {"action": "left_click", "tabId": 1111560199, "ref": "ref_31"} -> exit 0: {"ok": true, "data": {"clicked": "button \"Send\" (in a frame from frame-a.test:8971)"}, "pageContent": "untrusted"}
+  same-origin frame messages: ['delta-sameorigin-000']
+  => PASS ref-sameorigin-composer
+
+CASE background-framed-composer: decoy tab in front, drive the shared (background) tab
+  decoy tab activated; the shared tab is now in the background
+  iframe rect re-measured for the background case: {'x': 12, 'y': 270.875, 'w': 780, 'h': 470}
+  [bg-experiment] enabling focus emulation on the child frame's own CDP target (flatten attach, harness-side)
+  [bg-experiment] focus emulation ON for child target url=http://frame-b.test:8972/chat.html
+  [bg-experiment] chrome.debugger.getTargets() from the panel page: [{"type":"worker","url":"chrome-extension://nkeimhogjdpnpccoofpliimaahmaaome/thunk.js","attached":false},{"type":"worker","url":"chrome-extension://glbjnfimcajjenihimblfaponejbkoph/background.js","attached":false},{"type":"worker","url":"chrome-extension://kakpicabljpbdbhjokkldmlkdbgcehoj/sw.js","attached":false},{"type":"page","url":"chrome-extension://kakpicabljpbdbhjokkldmlkdbgcehoj/sidepanel.html","tabId":1111560200,"attached":true},{"type":"page","url":"http://frame-a.test:8971/parent.html","tabId":1111560199,"attached":true},{"type":"other","url":"http://frame-b.test:8972/chat.html","attached":true},{"type":"other","url":"chrome://omnibox-popup.top-chrome/omnibox_popup_aim.html","attached":false},{"type":"other","url":"chrome://webui-toolbar.top-chrome/","attached":false},{"type":"other","url":"chrome://omnibox-popup.top-chrome/","attached":false},{"type":"page","url":"about:blank","tabId":1111560198,"attached":false},{"type":"page","url":"http://frame-a.test:8971/parent.html","tabId":1111560201,"attached":false},{"type":"other","url":"http://frame-b.test:8972/chat.html","attached":false}]
+  [panel] APPROVED prompt: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.' -> {'ok': True}
+  client computer {"action": "left_click", "tabId": 1111560199, "coordinate": [402, 542]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  [panel] APPROVED prompt: 'Type where Muse cannot see the field' -- '(22 characters, hidden) into element (in a frame from frame-b.test:8972) on frame-a.test:8971. The typing goes into a frame from frame-b.test:8972. Muse cannot see if it is a password field.' -> {'ok': True}
+  client computer {"action": "type", "tabId": 1111560199, "text": "foxtrot-background-222"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  frame truth after typing: {'messages': ['alpha-composer-123', 'golf-refcross-333'], 'note': 'echo-forminput-111', 'composer': 'foxtrot-background-222'}
+  [panel] APPROVED prompt: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.' -> {'ok': True}
+  client computer {"action": "left_click", "tabId": 1111560199, "coordinate": [58, 678]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1111560199} -> exit 0: {"ok": true, "data": {"tabId": 1111560199, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\ncharlie-control-789\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG:
+  frame messages: ['alpha-composer-123', 'golf-refcross-333', 'foxtrot-background-222']
+  in framed message list (ground truth): True; in bridge read-back of parent tab: True
+  => PASS background-framed-composer
+panel prompts approved during the run: 12
+  approved: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.'
+  approved: 'Type where Muse cannot see the field' -- '(18 characters, hidden) into element (in a frame from frame-b.test:8972) on frame-a.test:8971. The typing goes into a frame from frame-b.test:8972. Muse cannot see if it is a password field.'
+  approved: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.'
+  approved: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.'
+  approved: 'Type where Muse cannot see the field' -- '(18 characters, hidden) into element (in a frame from frame-b.test:8972) on frame-a.test:8971. The typing goes into a frame from frame-b.test:8972. Muse cannot see if it is a password field.'
+  approved: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.'
+  approved: 'Type where Muse cannot see the field' -- '(17 characters, hidden) into element (in a frame from frame-b.test:8972) on frame-a.test:8971. The typing goes into a frame from frame-b.test:8972. Muse cannot see if it is a password field.'
+  approved: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.'
+  approved: 'Click' -- 'button "Send" (in a frame from frame-a.test:8971) on frame-a.test:8971. It may pay, send, order or delete something.'
+  approved: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.'
+  approved: 'Type where Muse cannot see the field' -- '(22 characters, hidden) into element (in a frame from frame-b.test:8972) on frame-a.test:8971. The typing goes into a frame from frame-b.test:8972. Muse cannot see if it is a password field.'
+  approved: 'Click' -- 'a frame from frame-b.test:8972 on frame-a.test:8971. It is inside a frame from frame-b.test:8972, embedded in this page. Muse cannot see what it is.'
+
+==== SUMMARY ====
+PASS framed-contenteditable
+PASS framed-textarea
+PASS parent-control
+PASS ref-cross-composer
+PASS ref-framed-textarea
+PASS ref-sameorigin-composer
+PASS background-framed-composer
