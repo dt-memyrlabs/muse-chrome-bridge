@@ -15,7 +15,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.4.0";
+const VERSION = "2.6.0";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -1166,6 +1166,8 @@ chrome.notifications.onClicked.addListener(async () => {
 /* ----------------------------------------------------------- debugger/CDP */
 const attached = new Map(); // tabId -> lastUse
 const attaching = new Map();
+const focusEmuTabs = new Set(); // tabIds where focus emulation is currently on
+const bridgeClicks = new Map(); // tabId -> {x, y, at} of the last press the bridge itself made
 
 async function attach(tabId) {
   if (attached.has(tabId)) return;
@@ -1180,12 +1182,20 @@ async function attach(tabId) {
 }
 async function detach(tabId) {
   worlds.delete(tabId);
+  const hadEmu = focusEmuTabs.delete(tabId);
+  bridgeClicks.delete(tabId);
   if (!attached.has(tabId)) return;
   attached.delete(tabId);
+  // Claude's detach order: end focus emulation first, then detach.
+  if (hadEmu) {
+    await withTimeout(chrome.debugger.sendCommand({ tabId },
+      "Emulation.setFocusEmulationEnabled", { enabled: false }), 3000, "cdp_timeout").catch(() => {});
+  }
   await chrome.debugger.detach({ tabId }).catch(() => {});
 }
 chrome.debugger.onDetach.addListener(async (src, reason) => {
   attached.delete(src.tabId); worlds.delete(src.tabId);
+  focusEmuTabs.delete(src.tabId); bridgeClicks.delete(src.tabId);
   if (reason !== "canceled_by_user") return;
   // The user pressed Cancel on Chrome's "being debugged" bar: stop that chat.
   const sid = await ownerOf(src.tabId);
@@ -1201,6 +1211,7 @@ const CDP_METHODS = new Set([
   "Accessibility.getPartialAXTree",
   "DOM.describeNode",
   "DOM.focus",
+  "DOM.getDocument",
   "DOM.getContentQuads",
   "DOM.getNodeForLocation",
   "DOM.resolveNode",
@@ -1231,6 +1242,28 @@ async function cdp(tabId, method, params, ms) {
     if (e.code) throw e;
     throw fail("page_error", method + ": " + String(e && e.message));
   }
+}
+
+// Focus emulation is a property of the tab session, not of one call:
+// Claude in Chrome's CDP wrapper enables it before Input commands and
+// ends it only at detach (detach() above disables it first, then
+// detaches — Claude's order). A tab that is not in front has no keyboard
+// focus and Chrome drops typed text while the call succeeds, so every
+// input path enables it once per tab and leaves it on for the session.
+async function ensureFocusEmulation(tabId) {
+  if (focusEmuTabs.has(tabId)) return;
+  focusEmuTabs.add(tabId);
+  await cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true })
+    .catch(() => { focusEmuTabs.delete(tabId); });
+}
+// A press the bridge made itself, remembered per tab: the type path
+// uses it to tell "the click I just made focused a field my probe
+// cannot see into" apart from "nothing is focused at all".
+const BRIDGE_CLICK_MS = 120000;
+function noteBridgeClick(tabId, x, y) { bridgeClicks.set(tabId, { x, y, at: Date.now() }); }
+function recentBridgeClick(tabId) {
+  const c = bridgeClicks.get(tabId);
+  return !!c && Date.now() - c.at <= BRIDGE_CLICK_MS;
 }
 
 // Code we run in the page runs in an isolated world: page scripts cannot
@@ -1377,14 +1410,18 @@ async function recheck(ctx, tab) {
 // so a ref always names one element on one tab. The same element keeps its ref while
 // its role and name stay the same; if either changes it gets a new ref, and
 // the old one answers target_changed.
-const refs = new Map();      // "ref_N" -> {tabId, b, role, name}
+const refs = new Map();      // "ref_N" -> {tabId, b, role, name} | framed hit (below)
 const nodeRefs = new Map();  // tabId -> Map(backendNodeId -> "ref_N")
+const frameRefs = new Map(); // tabId -> Map("frameId|entryIndex" -> "ref_N")
 let refSeq = 0;
 const refSeqReady = local.get("refSeq", 0).then((n) => { refSeq = Math.max(refSeq, Number(n) || 0); }).catch(() => {});
 function dropRefs(tabId) {
   const m = nodeRefs.get(tabId);
   if (m) for (const r of m.values()) refs.delete(r);
   nodeRefs.delete(tabId);
+  const fm = frameRefs.get(tabId);
+  if (fm) for (const r of fm.values()) refs.delete(r);
+  frameRefs.delete(tabId);
 }
 function refFor(tabId, b, role, name) {
   let m = nodeRefs.get(tabId);
@@ -1395,6 +1432,30 @@ function refFor(tabId, b, role, name) {
   const ref = "ref_" + (++refSeq);
   refs.set(ref, { tabId, b, role, name });
   m.set(b, ref);
+  return ref;
+}
+// A ref for an element inside a frame, from the all-frames read below.
+// It carries no backend node id — the root world cannot resolve framed
+// nodes — so it carries everything the point-dispatch path needs
+// instead: the frame it lives in, its index in that frame's tree build,
+// its fingerprint (fp, from the probe's describe()), its classification
+// facts, and the top-level point measured when it was read. The same
+// element keeps its ref while frame, index and fingerprint hold.
+function refForFramed(tabId, key, data) {
+  let m = frameRefs.get(tabId);
+  if (m && m.size > 50000) { dropRefs(tabId); m = null; }
+  if (!m) { m = new Map(); frameRefs.set(tabId, m); }
+  const old = m.get(key);
+  if (old) {
+    const h = refs.get(old);
+    if (h && h.fp === data.fp && h.role === data.role && h.name === data.name) {
+      h.point = data.point; h.buildId = data.buildId; h.idx = data.idx; h.facts = data.facts;
+      return old;
+    }
+  }
+  const ref = "ref_" + (++refSeq);
+  refs.set(ref, { tabId, ...data });
+  m.set(key, ref);
   return ref;
 }
 function refHit(ref) {
@@ -1416,7 +1477,302 @@ function axLine(n) {
   return { role: (n.role && n.role.value) || "", name: (n.name && n.name.value) || "" };
 }
 
-async function buildTree(tab, host, { filter = "all", depth = 15, refId = null, maxChars = 50000 }) {
+/* ------------------------------------------- all-frames reading (v2.6.0)
+ * The CDP accessibility tree (buildTreeAX below) contains no framed
+ * descendants in real Chrome: an iframe arrives as a bare node, so
+ * read_page and find were blind inside every frame — the factory.8090.ai
+ * shape, where the chat composer lives in an embedded frame. Claude in
+ * Chrome's answer is to build the element tree INSIDE every frame (its
+ * tree-builder content script is registered for all frames). The bridge
+ * does the same with the machinery it already trusts: the page probe —
+ * the protections' own classifier — runs in each frame's own document
+ * through scripting, and the worker stitches the per-frame trees into
+ * one, attaching each child frame's entries under the iframe element
+ * that holds it. Framed entries get frame-aware refs (refForFramed):
+ * they act through their measured top-level point, never through
+ * root-world node resolution. When scripting or the frame inventory is
+ * unavailable, buildTree falls back to the accessibility tree alone,
+ * exactly as before. */
+const frameTreeSeq = { n: 0 };
+
+// The tab's frame inventory (SPEC: keep a webNavigation.getAllFrames
+// map — it is the only reliable one). Null when the API is missing.
+async function tabFrames(tabId) {
+  if (!chrome.webNavigation || !chrome.webNavigation.getAllFrames) return null;
+  const frames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null);
+  if (!Array.isArray(frames) || !frames.length) return null;
+  const out = frames.filter((f) => f && typeof f.frameId === "number" && !f.errorOccurred);
+  return out.length ? out : null;
+}
+
+// Run the page probe inside ONE frame of the tab, addressed to that
+// frame's own document. Returns the probe's {host, v}, or null when the
+// frame cannot be scripted (restricted, gone, timed out).
+async function runInFrame(tabId, frameId, mode, args, ms) {
+  if (!chrome.scripting || !chrome.scripting.executeScript) return null;
+  const res = await withTimeout(chrome.scripting.executeScript({
+    target: { tabId, frameIds: [frameId] },
+    func: P.pageProbe,
+    args: [mode, { ...P.PROBE_ARGS, ...(args || {}) }],
+  }), ms || 6000, "script_timeout").catch(() => null);
+  const out = res && res[0] && res[0].result;
+  if (!out || typeof out !== "object" || out.v == null) return null;
+  return out;
+}
+
+// The probe result must come from the document the frame inventory
+// says is there. Frames with no host of their own (about:, data:,
+// blob:) report the embedder's host and are taken as they come.
+function frameHostOk(frame, out) {
+  if (!out) return false;
+  const want = P.hostOf(frame.url);
+  return !want || out.host === want;
+}
+
+// A point inside `frameId`'s viewport, moved to top-level viewport
+// coordinates: walk the frame chain adding each iframe element's rect
+// origin and border (left + clientLeft, top + clientTop) — the same
+// accumulation measureNode does from inside the page, done here frame
+// by frame because no single document can see across a cross-origin
+// boundary. Sibling frames with the same URL are matched to iframe
+// elements by occurrence; when no src matches at all, document order
+// against frame order is the fallback. Null when a hop cannot be read.
+async function frameOffsetPoint(tab, frames, frameId, cx, cy, rectsCache) {
+  let x = cx, y = cy;
+  let cur = frames.find((f) => f.frameId === frameId);
+  let hops = 0;
+  while (cur && cur.frameId !== 0) {
+    if (++hops > 10) return null;
+    let list = rectsCache && rectsCache.get(cur.parentFrameId);
+    if (!list) {
+      const out = await runInFrame(tab.id, cur.parentFrameId, "frames", {});
+      if (!out || !Array.isArray(out.v)) return null;
+      list = out.v;
+      if (rectsCache) rectsCache.set(cur.parentFrameId, list);
+    }
+    const sibs = frames.filter((s) => s.parentFrameId === cur.parentFrameId);
+    const sameUrl = sibs.filter((s) => s.url === cur.url);
+    const occ = Math.max(0, sameUrl.indexOf(cur));
+    const bySrc = list.filter((r) => r.src && r.src === cur.url);
+    const el = bySrc[occ] || bySrc[0] || list[Math.max(0, sibs.indexOf(cur))];
+    if (!el) return null;
+    x += el.left + (el.clientLeft || 0);
+    y += el.top + (el.clientTop || 0);
+    cur = frames.find((f) => f.frameId === cur.parentFrameId);
+  }
+  return cur ? { x, y } : null;
+}
+
+// The resolved src of each Iframe node in the accessibility tree, so a
+// child frame can be attached under the element that actually holds it.
+async function axIframeSrcs(tab, nodes) {
+  const out = new Map();
+  for (const n of nodes) {
+    if (axLine(n).role !== "Iframe" || n.backendDOMNodeId == null) continue;
+    let src = "";
+    try {
+      const { node } = await cdp(tab.id, "DOM.describeNode", { backendNodeId: n.backendDOMNodeId });
+      const arr = (node && node.attributes) || [];
+      const at = {};
+      for (let i = 0; i + 1 < arr.length; i += 2) at[String(arr[i]).toLowerCase()] = arr[i + 1];
+      if (at.src) src = new URL(at.src, tab.url).href;
+    } catch (e) { /* the order fallback in the caller covers it */ }
+    out.set(n.nodeId, src);
+  }
+  return out;
+}
+
+async function buildTreeMerged(tab, host, frames, { filter = "all", depth = 15, refId = null, maxChars = 50000 }) {
+  await refSeqReady;
+  // The top frame is read exactly as the AX-only build reads it, so
+  // top-frame refs keep their backend node ids and every behavior that
+  // hangs off them (form_input's DOM path, file_upload) is unchanged.
+  const { nodes } = await cdp(tab.id, "Accessibility.getFullAXTree", {});
+  await assertHost(tab, host);
+  const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+  const refOf = new Map();
+  for (const n of nodes) {
+    if (n.ignored || n.backendDOMNodeId == null) continue;
+    const { role, name } = axLine(n);
+    if (P.INTERACTIVE_ROLES.has(role) || name) refOf.set(n.nodeId, refFor(tab.id, n.backendDOMNodeId, role, name));
+  }
+  // One tree build per child frame, in that frame's own document.
+  const buildId = tab.id + ":" + (++frameTreeSeq.n);
+  const childData = new Map(); // frameId -> {frame, entries}
+  for (const f of frames) {
+    if (f.frameId === 0) continue;
+    const out = await runInFrame(tab.id, f.frameId, "tree", { filter, depth: 15, build: buildId });
+    if (!frameHostOk(f, out)) continue;
+    childData.set(f.frameId, { frame: f, entries: Array.isArray(out.v.entries) ? out.v.entries : [] });
+  }
+  if (!childData.size) return null; // scripting reached no frame: AX fallback
+  local.set("refSeq", refSeq).catch(() => {});
+  // Iframe rects per document, for the build-time points on framed refs.
+  const rectsCache = new Map();
+  for (const f of frames) {
+    const out = await runInFrame(tab.id, f.frameId, "frames", {});
+    if (out && Array.isArray(out.v)) rectsCache.set(f.frameId, out.v);
+  }
+  // Assemble one node tree: {ref, role, name, children}. AX nodes with
+  // no ref print no line and add no depth (the AX-only walk's rule), so
+  // they are flattened away here; their ref'd descendants rise.
+  const nodeByRef = new Map();
+  const mkNode = (ref, role, name, flatExtra) => {
+    const nd = { ref, role, name, children: [], flatExtra: flatExtra || null };
+    if (ref) nodeByRef.set(ref, nd);
+    return nd;
+  };
+  const axChildren = (axNode) => {
+    const out = [];
+    for (const cid of axNode.childIds || []) {
+      const cn = byId.get(cid);
+      if (!cn) continue;
+      const ref = refOf.get(cn.nodeId);
+      if (ref && !cn.ignored) {
+        const { role, name } = axLine(cn);
+        const nd = mkNode(ref, role, name);
+        nd.axNodeId = cn.nodeId;
+        nd.children = axChildren(cn);
+        out.push(nd);
+      } else out.push(...axChildren(cn));
+    }
+    return out;
+  };
+  const vroot = { ref: null, role: "", name: "", children: [] };
+  const axRoot = nodes.find((n) => !n.parentId);
+  if (axRoot) {
+    const rref = refOf.get(axRoot.nodeId);
+    if (rref && !axRoot.ignored) {
+      const { role, name } = axLine(axRoot);
+      const nd = mkNode(rref, role, name);
+      nd.axNodeId = axRoot.nodeId;
+      nd.children = axChildren(axRoot);
+      vroot.children.push(nd);
+    } else vroot.children = axChildren(axRoot);
+  }
+  // Framed entries -> nodes, nested by their in-frame depth.
+  const frameNodes = new Map();   // frameId -> [root nodes]
+  const frameIframes = new Map(); // frameId -> [{node, src, used}]
+  for (const [fid, { frame, entries }] of childData) {
+    const roots = [], stack = [], iframes = [];
+    for (const e of entries) {
+      const point = await frameOffsetPoint(tab, frames, fid, e.cx, e.cy, rectsCache).catch(() => null);
+      const ref = refForFramed(tab.id, fid + "|" + e.i, {
+        framed: true, frameId: fid, parentFrameId: frame.parentFrameId,
+        frameUrl: frame.url, frameHost: P.hostOf(frame.url), buildId,
+        idx: e.i, fp: e.fp, role: e.role, name: e.name, facts: e, point,
+      });
+      const nd = mkNode(ref, e.role, e.name, { frameUrl: frame.url });
+      nd.entry = e;
+      while (stack.length && stack[stack.length - 1].depth >= e.depth) stack.pop();
+      if (stack.length) stack[stack.length - 1].node.children.push(nd); else roots.push(nd);
+      stack.push({ depth: e.depth, node: nd });
+      if (e.src !== undefined) iframes.push({ node: nd, src: e.src || "", used: false });
+    }
+    frameNodes.set(fid, roots);
+    frameIframes.set(fid, iframes);
+  }
+  // Attach each frame's roots under the iframe element that holds it:
+  // parents before children, src match first, order as the fallback. A
+  // frame whose holder cannot be identified keeps its roots at the end
+  // of the tree — visible, with working refs, honestly unplaced.
+  const chainDepth = (f) => {
+    let d = 0, cur = f;
+    while (cur && cur.frameId !== 0 && d <= 10) { d++; cur = frames.find((x) => x.frameId === cur.parentFrameId); }
+    return d;
+  };
+  const axSrcs = await axIframeSrcs(tab, nodes);
+  const usedAx = new Set();
+  const ordered = [...childData.values()].sort((a, b) => chainDepth(a.frame) - chainDepth(b.frame));
+  for (const { frame } of ordered) {
+    const roots = frameNodes.get(frame.frameId);
+    if (!roots || !roots.length) continue;
+    let attached = false;
+    if (frame.parentFrameId === 0) {
+      const cands = nodes.filter((n) => axLine(n).role === "Iframe" && refOf.has(n.nodeId) && !usedAx.has(n.nodeId));
+      const target = cands.find((n) => axSrcs.get(n.nodeId) && axSrcs.get(n.nodeId) === frame.url)
+        || cands.find((n) => !axSrcs.get(n.nodeId)) || cands[0];
+      const nd = target && nodeByRef.get(refOf.get(target.nodeId));
+      if (nd) { nd.children.push(...roots); usedAx.add(target.nodeId); attached = true; }
+    } else {
+      const sibs = (frameIframes.get(frame.parentFrameId) || []).filter((x) => !x.used);
+      const hit = sibs.find((x) => x.src && x.src === frame.url) || sibs[0];
+      if (hit) { hit.node.children.push(...roots); hit.used = true; attached = true; }
+    }
+    if (!attached) vroot.children.push(...roots);
+  }
+  // Render, with read_page's line shape and truncation rule.
+  const lines = [], flat = [];
+  let chars = 0, truncated = false;
+  const render = (nd, indent, d) => {
+    if (truncated || d > depth) return;
+    let next = indent;
+    if (nd.ref && (filter !== "interactive" || P.INTERACTIVE_ROLES.has(nd.role))) {
+      const line = `${"  ".repeat(indent)}${nd.role}${nd.name ? ` "${P.clip(nd.name, 100)}"` : ""} [${nd.ref}]`;
+      if (chars + line.length + 1 > maxChars) { truncated = true; return; }
+      lines.push(line); chars += line.length + 1; next = indent + 1;
+      flat.push({ ref: nd.ref, role: nd.role, name: nd.name, ...(nd.flatExtra || {}) });
+    }
+    for (const c of nd.children) render(c, next, d + 1);
+  };
+  if (refId) {
+    const rootNode = nodeByRef.get(refId);
+    if (!rootNode) throw fail("no_such_ref", "that ref is not on this page now; read_page again");
+    render(rootNode, 0, 0);
+  } else for (const c of vroot.children) render(c, 0, 0);
+  return { text: lines.join("\n") + (truncated ? `\n[truncated at ${maxChars} chars — use ref_id or depth to narrow]` : ""), flat };
+}
+
+async function buildTree(tab, host, opts) {
+  const frames = await tabFrames(tab.id).catch(() => null);
+  if (frames && frames.some((f) => f.frameId !== 0)) {
+    const merged = await buildTreeMerged(tab, host, frames, opts || {}).catch(() => null);
+    if (merged) return merged;
+  }
+  return buildTreeAX(tab, host, opts || {});
+}
+
+// The framed element a ref names, located fresh in its own frame: the
+// stashed build is re-measured (scrolling it into view first), and if
+// that build is gone — the frame navigated, the stash was dropped —
+// the frame's tree is rebuilt and the same element found again by
+// fingerprint. Anything else is target_changed, exactly as a stale
+// backend ref is.
+async function locateFramedEntry(tab, hit) {
+  const frames = await tabFrames(tab.id);
+  if (!frames) throw fail("target_changed", "that element's frame is gone; read_page again");
+  const fr = frames.find((f) => f.frameId === hit.frameId);
+  if (!fr) throw fail("target_changed", "that element's frame is gone; read_page again");
+  let m = await runInFrame(tab.id, hit.frameId, "measure", { build: hit.buildId, i: hit.idx });
+  if (!m || !m.v || !m.v.d || m.v.d.fp !== hit.fp) {
+    const buildId = tab.id + ":" + (++frameTreeSeq.n);
+    const out = await runInFrame(tab.id, hit.frameId, "tree", { filter: "all", depth: 15, build: buildId });
+    if (!frameHostOk(fr, out)) throw fail("target_changed", "that element's frame could not be read again; read_page again");
+    const entries = Array.isArray(out.v.entries) ? out.v.entries : [];
+    const idx = entries[hit.idx] && entries[hit.idx].fp === hit.fp ? hit.idx : entries.findIndex((e) => e && e.fp === hit.fp);
+    if (idx < 0) throw fail("target_changed", "that element is gone; read_page again");
+    hit.buildId = buildId; hit.idx = idx;
+    m = await runInFrame(tab.id, hit.frameId, "measure", { build: buildId, i: idx });
+    if (!m || !m.v || !m.v.d || m.v.d.fp !== hit.fp) throw fail("target_changed", "that element is gone; read_page again");
+  }
+  return { frames, frame: fr, entry: m.v };
+}
+
+// A framed ref's point at action time: located fresh (which scrolls it
+// into view inside its frame — that scroll also brings the frame
+// itself into view in its ancestors), settled briefly, re-measured,
+// then moved to top-level coordinates by the frame chain.
+async function framedPoint(tab, hit) {
+  await locateFramedEntry(tab, hit);
+  await sleep(120);
+  const loc = await locateFramedEntry(tab, hit);
+  const p = await frameOffsetPoint(tab, loc.frames, hit.frameId, loc.entry.cx, loc.entry.cy, null).catch(() => null);
+  if (p) return { x: p.x, y: p.y, entry: loc.entry };
+  if (hit.point) return { x: hit.point.x, y: hit.point.y, entry: loc.entry };
+  throw fail("not_visible", "that element is inside a frame and its position could not be measured; read_page again");
+}
+
+async function buildTreeAX(tab, host, { filter = "all", depth = 15, refId = null, maxChars = 50000 }) {
   await refSeqReady;
   const { nodes } = await cdp(tab.id, "Accessibility.getFullAXTree", {});
   await assertHost(tab, host);
@@ -1479,6 +1835,40 @@ const SMOOTH_WIN_SRC = `function (dx, dy) {
   try { window.scrollBy({ left: dx, top: dy, behavior: "smooth" }); return true; }
   catch (e) { return false; }
 }`;
+// Claude's way to an element's point: measure it in the page. The
+// centre of the element's bounding rect, in TOP-LEVEL viewport
+// coordinates: start from the rect in the element's own document, then
+// walk up the frame chain adding each frame element's rect origin and
+// border (clientLeft/clientTop) — same-origin frames only. A hop that
+// cannot be read (a cross-origin frame in the chain) makes the whole
+// measurement null: the caller then falls back, it does not guess.
+const MEASURE_NODE_SRC = `function () {
+  try {
+    if (!this || typeof this.getBoundingClientRect !== "function") return null;
+    const r = this.getBoundingClientRect();
+    if (!r) return null;
+    let x = r.left + r.width / 2, y = r.top + r.height / 2, hops = 0;
+    let doc = this.ownerDocument;
+    while (doc && doc.defaultView && doc.defaultView.frameElement) {
+      const fe = doc.defaultView.frameElement;
+      const fr = typeof fe.getBoundingClientRect === "function" ? fe.getBoundingClientRect() : null;
+      if (!fr) return null;
+      x += fr.left + (fe.clientLeft || 0);
+      y += fr.top + (fe.clientTop || 0);
+      doc = fe.ownerDocument;
+      if (++hops > 10) return null;
+    }
+    return { x, y, w: r.width, h: r.height, framed: hops > 0 };
+  } catch (e) { return null; }
+}`;
+// The node's point measured in the page, or null when the page cannot
+// measure it from the root world (no layout access, or a cross-origin
+// frame in the chain).
+async function measureNode(tab, backendNodeId) {
+  const m = await runInWorld(tab, backendNodeId, MEASURE_NODE_SRC, []).catch(() => null);
+  if (!m || !Number.isFinite(m.x) || !Number.isFinite(m.y)) return null;
+  return m;
+}
 
 async function quadsCenter(tabId, backendNodeId) {
   const { quads } = await cdp(tabId, "DOM.getContentQuads", { backendNodeId });
@@ -1494,7 +1884,13 @@ async function quadsCenter(tabId, backendNodeId) {
 async function smoothShowNode(tab, backendNodeId) {
   const v = await viewport(tab.id);
   const onScreen = (c) => c && c.x >= -4 && c.y >= -4 && c.x <= v.w + 4 && c.y <= v.h + 4;
-  let c = await quadsCenter(tab.id, backendNodeId).catch(() => null);
+  // In-page measurement first (above): for a node inside a same-origin
+  // frame it is the only read whose coordinates are known to be
+  // top-level viewport coordinates. CDP content quads are the fallback
+  // for nodes the page cannot measure; their space is the root page's.
+  let read = () => measureNode(tab, backendNodeId);
+  let c = await read();
+  if (!c) { read = () => quadsCenter(tab.id, backendNodeId).catch(() => null); c = await read(); }
   if (!c || onScreen(c)) return c;
   await runInWorld(tab, backendNodeId, SMOOTH_NODE_SRC, []).catch(() => false);
   // Settled means: the element first MOVED (an animated scroll takes a
@@ -1506,7 +1902,7 @@ async function smoothShowNode(tab, backendNodeId) {
   let prev = c, stable = 0, moved = false;
   while (Date.now() < end) {
     await sleep(50);
-    const n = await quadsCenter(tab.id, backendNodeId).catch(() => null);
+    const n = await read();
     if (!n) return null;
     c = n;
     if (Math.abs(n.x - start.x) > 1 || Math.abs(n.y - start.y) > 1) moved = true;
@@ -1643,15 +2039,31 @@ async function axFocused(tabId) {
 
 /* ------------------------------------------------------------------ input */
 async function mouse(tabId, type, x, y, extra) {
+  await ensureFocusEmulation(tabId);
   await cdp(tabId, "Input.dispatchMouseEvent", { type, x, y, ...extra });
 }
+const BUTTON_BITS = { left: 1, middle: 4, right: 2 };
+// A click, Claude's sequence on the tab session: focus emulation is
+// already on (mouse() ensures it); a beat after the cursor arrives,
+// mouseMoved, then per click mousePressed (buttons bitmask, clickCount,
+// force while held) → a short pause → mouseReleased (buttons 0), with
+// 100 ms between repeated clicks. Coordinates are viewport CSS pixels,
+// rounded; the browser hit-tests the press into whichever frame sits
+// under the point and focuses that frame's field — no in-page focus
+// call exists in this path, by design.
 async function clickAt(tabId, x, y, button, count, modifiers) {
   lastInput.set(tabId, Date.now());
+  x = Math.round(x); y = Math.round(y);
+  await sleep(50);
   await mouse(tabId, "mouseMoved", x, y, { modifiers });
   for (let i = 1; i <= count; i++) {
-    await mouse(tabId, "mousePressed", x, y, { button, clickCount: i, modifiers });
-    await mouse(tabId, "mouseReleased", x, y, { button, clickCount: i, modifiers });
+    if (i > 1) await sleep(100);
+    await mouse(tabId, "mousePressed", x, y,
+      { button, buttons: BUTTON_BITS[button] || 1, clickCount: i, modifiers, force: 0.5 });
+    await sleep(12);
+    await mouse(tabId, "mouseReleased", x, y, { button, buttons: 0, clickCount: i, modifiers });
   }
+  noteBridgeClick(tabId, x, y);
 }
 function modMask(s) {
   let m = 0;
@@ -1660,21 +2072,12 @@ function modMask(s) {
   }
   return m;
 }
-// A tab that is not in front has no keyboard focus: Chrome drops typed text
-// while the call succeeds. Emulate focus
-// while input is sent, then switch it off again.
-async function withFocus(tabId, fn) {
-  await cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
-  try { return await fn(); }
-  finally { await cdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: false }).catch(() => {}); }
-}
 async function sendKey(tabId, k) {
   lastInput.set(tabId, Date.now());
   const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, modifiers: k.modifiers };
-  await withFocus(tabId, async () => {
-    await cdp(tabId, "Input.dispatchKeyEvent", { type: k.text ? "keyDown" : "rawKeyDown", text: k.text || undefined, ...base });
-    await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
-  });
+  await ensureFocusEmulation(tabId);
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: k.text ? "keyDown" : "rawKeyDown", text: k.text || undefined, ...base });
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
 }
 const isPaste = (k) => (k.key.toLowerCase() === "v" && (k.modifiers & (2 | 4))) || (k.key === "Insert" && (k.modifiers & 8));
 
@@ -1945,7 +2348,7 @@ TOOLS.find = async (ctx, a) => {
   const host = P.hostOf(tab.url);
   const { flat } = await buildTree(tab, host, { maxChars: 1e9, depth: 60 });
   const hits = P.rankForQuery(flat, a.query);
-  const matches = hits.map((h) => ({ ref: h.ref, role: h.role, name: h.name }));
+  const matches = hits.map((h) => ({ ref: h.ref, role: h.role, name: h.name, ...(h.frameUrl ? { frame: h.frameUrl } : {}) }));
   await audit(ctx.chat, "find", `${host} (${JSON.stringify(matches).length} chars)`, "ok");
   return { tabId: tab.id, matches };
 };
@@ -2176,14 +2579,44 @@ TOOLS.computer = async (ctx, a) => {
   // the point read afterwards is the rested on-screen position and the
   // user sees the page move before anything is pressed.
   const POINTED = ["left_click", "right_click", "double_click", "triple_click", "hover", "scroll_to", "left_click_drag"];
-  let x, y, backend = null;
+  let x, y, backend = null, framedHit = null;
   if (a.ref != null) {
-    backend = await nodeForRef(tab, a.ref);
-    if (POINTED.includes(action)) {
-      const c = await smoothShowNode(tab, backend).catch(() => null);
-      if (c) { x = c.x; y = c.y; }
+    const hit = refHit(a.ref);
+    if (hit.framed) {
+      // A ref from the all-frames read: the element lives in a frame
+      // the root world cannot resolve, so it is acted on by its
+      // measured top-level point — the point-dispatch path — never by
+      // node resolution. The press is still gated on what sits at that
+      // point (analyzePoint, via gatedPress), exactly like a
+      // coordinate click.
+      framedHit = hit;
+      if (POINTED.includes(action)) {
+        const p = await framedPoint(tab, hit).catch((e) => { if (e && e.code) throw e; return null; });
+        if (p) { x = p.x; y = p.y; }
+      }
+      if (x == null && Array.isArray(a.coordinate)) {
+        const [cx, cy] = a.coordinate.map(Number);
+        if (Number.isFinite(cx) && Number.isFinite(cy)) { x = cx; y = cy; }
+      }
+      if (x == null && POINTED.includes(action)) {
+        throw fail("not_visible", "that element is inside a frame and its position could not be measured; read_page again");
+      }
+    } else {
+      backend = await nodeForRef(tab, a.ref);
+      if (POINTED.includes(action)) {
+        const c = await smoothShowNode(tab, backend).catch(() => null);
+        if (c) { x = c.x; y = c.y; }
+      }
+      if (x == null && Array.isArray(a.coordinate)) {
+        // No in-page measurement can reach the target (it lives in a
+        // cross-origin frame): the caller's point — read off a
+        // screenshot — is the contract, and is dispatched unchanged.
+        // Framed elements are reached by coordinates.
+        const [cx, cy] = a.coordinate.map(Number);
+        if (Number.isFinite(cx) && Number.isFinite(cy)) { x = cx; y = cy; }
+      }
+      if (x == null) ({ x, y } = await pointForNode(tab.id, backend));
     }
-    if (x == null) ({ x, y } = await pointForNode(tab.id, backend));
   } else if (Array.isArray(a.coordinate)) {
     [x, y] = a.coordinate.map(Number);
     if (!Number.isFinite(x) || !Number.isFinite(y)) throw fail("bad_coordinate");
@@ -2226,6 +2659,7 @@ TOOLS.computer = async (ctx, a) => {
       const direct = async () => { await recheck(ctx, tab); return { scrolled: await runInWorld(tab, null, SCROLL_SRC, [px, py, dx, dy]), via: "direct" }; };
       if (!tab.active) return direct();
       try {
+        await ensureFocusEmulation(tab.id);
         await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseWheel", x: px, y: py, deltaX: dx, deltaY: dy }, 3000);
       } catch (e) {
         if (e.code !== "cdp_timeout") throw e;
@@ -2234,6 +2668,13 @@ TOOLS.computer = async (ctx, a) => {
       return {};
     }
     case "scroll_to": {
+      if (framedHit) {
+        // Locating the framed element scrolls it into view inside its
+        // frame (and the frame into view in its ancestors).
+        const p = await framedPoint(tab, framedHit);
+        await cursorGo(tab.id, p.x, p.y, false);
+        return {};
+      }
       if (backend == null) throw fail("need_ref");
       // Visible, animated — not the instant jump this used to make.
       const c = await smoothShowNode(tab, backend).catch(() => null);
@@ -2283,7 +2724,20 @@ TOOLS.computer = async (ctx, a) => {
     case "type": {
       const text = String(a.text == null ? "" : a.text);
       const f = await focusInfo(tab, host);
-      const c = classifyTypingPaid(f);
+      // Type targets focus, never a node (Claude's model). The probe
+      // reads focus from the root document, so a field inside a frame
+      // can hold the browser's real focus while the probe reports
+      // "none" — the frame's focus is not visible from the root world.
+      // When the bridge's own click just landed on this tab, that
+      // click is what put focus there: send the text and let it land
+      // where the click put it, with no human pre-click. With no
+      // bridge click and no focus at all, say so honestly instead of
+      // inserting into the void.
+      const blindAfterClick = f.kind === "none" && recentBridgeClick(tab.id);
+      if (f.kind === "none" && !blindAfterClick) {
+        throw fail("not_focused", "nothing on this page has keyboard focus, so the text would go nowhere. Click the field first, then type.");
+      }
+      const c = blindAfterClick ? { ask: false } : classifyTypingPaid(f);
       if (c.ask) {
         await ask(ctx, f.isPassword ? "Type into a password field" : isPayFocus(f) ? "Type into a payment field" : "Type where Muse cannot see the field", `${P.shownTyping(text, true)} into ${P.describeTarget(f)} on ${host}. ${c.reason}`, tab.url);
         await recheck(ctx, tab);
@@ -2291,8 +2745,9 @@ TOOLS.computer = async (ctx, a) => {
         if (f2.fp2 !== f.fp2) throw fail("target_changed", "focus moved while the user was deciding");
       }
       checkLive(ctx);
-      await withFocus(tab.id, () => cdp(tab.id, "Input.insertText", { text }));
-      if (text && f.isField && typeof f.len === "number") {
+      await ensureFocusEmulation(tab.id);
+      await cdp(tab.id, "Input.insertText", { text });
+      if (!blindAfterClick && text && f.isField && typeof f.len === "number") {
         const f3 = await focusInfo(tab, host).catch(() => null);
         if (f3 && f3.fp === f.fp && f3.len === f.len) {
           await audit(ctx.chat, "type", P.shownTyping(text, c.ask || f.isPassword) + " @ " + host, "not_typed");
@@ -2312,9 +2767,72 @@ TOOLS.computer = async (ctx, a) => {
   }
 };
 
+// form_input for a ref from the all-frames read. The field is
+// classified from the probe's own describe() facts, measured fresh in
+// its frame (locateFramedEntry), and set through the point-dispatch
+// path — a real press at its top-level point focuses it in its frame,
+// and the value follows focus — never through root-world node
+// resolution. Classification, prompting and the post-approval
+// re-verification mirror TOOLS.form_input's root-world path, fact
+// for fact.
+async function formInputFramed(ctx, tab, host, hit, a) {
+  let loc = await locateFramedEntry(tab, hit);
+  const d = loc.entry.d;
+  if (!d || !d.isField) throw fail("not_a_field", "form_input sets text fields, checkboxes, radios and selects; click buttons with computer");
+  if (!d.role && hit.role) d.role = hit.role;
+  if (!d.name && hit.name) d.name = hit.name;
+  d.frameHost = hit.frameHost || "";
+  const cls = P.classifyFormInput(d);
+  const secret = cls.secret;
+  if (cls.ask) {
+    const title = d.isPassword ? "Fill a password field" : d.isPayField ? "Fill a payment field" : "Fill a field in a sensitive form";
+    await ask(ctx, title, `${P.shownTyping(a.value, secret)} into ${P.describeTarget(d)} on ${host}. ${cls.reason}`, tab.url);
+    await recheck(ctx, tab);
+    const loc2 = await locateFramedEntry(tab, hit);
+    const d2 = loc2.entry.d;
+    if (!d2) throw fail("target_changed");
+    const cls2 = P.classifyFormInput(d2);
+    const factKeys = ["isPayField", "isPassword", "formHasPayment", "formHasPassword", "formRiskySubmit"];
+    if (d2.fp !== d.fp || cls2.ask !== cls.ask || cls2.secret !== cls.secret ||
+        factKeys.some((k) => !!d2[k] !== !!d[k])) throw fail("target_changed");
+    loc = loc2;
+  }
+  checkLive(ctx);
+  const kind = d.tag === "select" ? "select" : (d.type === "checkbox" || d.type === "radio") ? "check" : "text";
+  if (kind === "select") {
+    // A native select's options cannot be chosen by a point press with
+    // any reliability; say so rather than fake a set.
+    throw fail("unsupported_in_frame", "a select inside a frame cannot be set directly; click it and choose the option");
+  }
+  const p = await framedPoint(tab, hit);
+  await cursorGo(tab.id, p.x, p.y, true);
+  if (kind === "text") {
+    const v = String(a.value == null ? "" : a.value);
+    await clickAt(tab.id, p.x, p.y, "left", 1, 0); // the press focuses the framed field
+    // Replace, do not append: form_input SETS the value. Select-all
+    // first, the way the root-world path selects before inserting.
+    await sendKey(tab.id, P.parseKeys("ctrl+a")[0]);
+    if (v) {
+      await ensureFocusEmulation(tab.id);
+      await cdp(tab.id, "Input.insertText", { text: v });
+    } else await sendKey(tab.id, P.parseKeys("Delete")[0]);
+  } else {
+    const on = a.value === true || a.value === 1 || /^(true|1|on|yes|checked)$/i.test(String(a.value).trim());
+    if (loc.entry.checked !== on) {
+      await clickAt(tab.id, p.x, p.y, "left", 1, 0); // a press toggles it
+      const after = await locateFramedEntry(tab, hit).catch(() => null);
+      if (!after || after.entry.checked !== on) throw fail("page_error", "the press did not change that control");
+    }
+  }
+  await audit(ctx.chat, "form_input", P.describeTarget(d) + " = " + P.shownTyping(a.value, secret) + " @ " + host, "ok");
+  return { set: P.describeTarget(d) };
+}
+
 TOOLS.form_input = async (ctx, a) => {
   const tab = await resolveTab(ctx, refTab(a));
   const host = P.hostOf(tab.url);
+  const hit0 = a.ref != null ? refHit(a.ref) : null;
+  if (hit0 && hit0.framed) return formInputFramed(ctx, tab, host, hit0, a);
   const backend = await nodeForRef(tab, a.ref);
   const d = await probe(tab, host, "node", {}, backend);
   if (!d || !d.isField) throw fail("not_a_field", "form_input sets text fields, checkboxes, radios and selects; click buttons with computer");
@@ -2356,11 +2874,29 @@ TOOLS.form_input = async (ctx, a) => {
   if (fc) await cursorGo(tab.id, fc.x, fc.y, false);
   const kind = d.tag === "select" ? "select" : (d.type === "checkbox" || d.type === "radio") ? "check" : "text";
   if (kind === "text") {
-    await cdp(tab.id, "DOM.focus", { backendNodeId: backend });
-    await runInWorld(tab, backend,
-      "function () { if (this.select) this.select(); else { const r = document.createRange(); r.selectNodeContents(this); const s = getSelection(); s.removeAllRanges(); s.addRange(r); } }");
     const v = String(a.value == null ? "" : a.value);
-    if (v) await withFocus(tab.id, () => cdp(tab.id, "Input.insertText", { text: v }));
+    let rooted = true;
+    try {
+      await cdp(tab.id, "DOM.focus", { backendNodeId: backend });
+      await runInWorld(tab, backend,
+        "function () { if (this.select) this.select(); else { const r = document.createRange(); r.selectNodeContents(this); const s = getSelection(); s.removeAllRanges(); s.addRange(r); } }");
+    } catch (e) { rooted = false; }
+    if (!rooted) {
+      // The field is not resolvable in the root world — it lives in a
+      // frame. Focus it the way Claude in Chrome does: a real press at
+      // its measured point, which the browser routes into the frame
+      // and focuses there; the text then follows focus. (This press is
+      // a focus click inside an operation already classified and, when
+      // required, approved above — the same footing as the DOM.focus
+      // it replaces, not a new activation.)
+      if (!fc) throw fail("target_changed", "that element is gone; read_page again");
+      await cursorGo(tab.id, fc.x, fc.y, true);
+      await clickAt(tab.id, fc.x, fc.y, "left", 1, 0);
+    }
+    if (v) {
+      await ensureFocusEmulation(tab.id);
+      await cdp(tab.id, "Input.insertText", { text: v });
+    }
     else await sendKey(tab.id, P.parseKeys("Delete")[0]);
   } else {
     const res = await runInWorld(tab, backend, `function (v) {
@@ -2478,6 +3014,8 @@ TOOLS.file_upload = async (ctx, a) => {
   }
   const tab = await resolveTab(ctx, refTab(a));
   const host = P.hostOf(tab.url);
+  const hitU = a.ref != null ? refHit(a.ref) : null;
+  if (hitU && hitU.framed) throw fail("not_a_file_input", "that element is inside a frame; uploads into framed file inputs are not supported");
   const backend = await nodeForRef(tab, a.ref);
   const d = await probe(tab, host, "node", {}, backend);
   if (!d || d.tag !== "input" || d.type !== "file") throw fail("not_a_file_input");
