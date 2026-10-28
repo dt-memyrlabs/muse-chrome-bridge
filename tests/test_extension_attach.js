@@ -33,6 +33,15 @@ async function share(tabId) {
   return req.reqId;
 }
 const acks = (since, sid) => sent.slice(since).filter((m) => (m.t === "paired_ack" || m.t === "paired_nack") && m.sessionId === sid);
+// v2.7: a share (fresh pair or attach) lands only on the ONE
+// full-control confirmation in the panel.
+async function approveShare() {
+  for (let i = 0; i < 200; i++) {
+    const sp = ((await panel("state")).prompts || []).find((p) => /full control/i.test(p.title));
+    if (sp) { await panel("approve", { id: sp.id }); return; }
+    await tick(5);
+  }
+}
 
 (async () => {
   let hello;
@@ -45,6 +54,7 @@ const acks = (since, sid) => sent.slice(since).filter((m) => (m.t === "paired_ac
   const t1 = mkTab("https://shop.example.com/admin", { active: true });
   const req1 = await share(t1.id);
   FakeWS.last.deliver({ t: "paired", reqId: req1, sessionId: "sess-A", chatName: "Chat A" });
+  await approveShare();
   await tick(30);
   check("fresh pairing owns tab 1", (await owner(t1.id)) === "Chat A");
 
@@ -53,6 +63,7 @@ const acks = (since, sid) => sent.slice(since).filter((m) => (m.t === "paired_ac
   const req2 = await share(t2.id);
   let sn = sent.length;
   FakeWS.last.deliver({ t: "paired", reqId: req2, sessionId: "sess-A", chatName: "Chat A", attach: true });
+  await approveShare();
   await tick(30);
   check("attach acks true (not session_exists)", acks(sn, "sess-A").some((m) => m.t === "paired_ack"), acks(sn, "sess-A"));
   check("the attached tab belongs to Chat A, with its pill", (await owner(t2.id)) === "Chat A" && F.pillOf[t2.id] === "Chat A");
@@ -80,6 +91,7 @@ const acks = (since, sid) => sent.slice(since).filter((m) => (m.t === "paired_ac
   const req4 = await share(t4.id);
   sn = sent.length;
   FakeWS.last.deliver({ t: "paired", reqId: req4, sessionId: "sess-Z", chatName: "Chat Z", attach: true });
+  await approveShare();
   await tick(30);
   check("attach for an unknown session heals as a fresh pairing under the relay's id",
         acks(sn, "sess-Z").some((m) => m.t === "paired_ack") && (await owner(t4.id)) === "Chat Z");
@@ -99,11 +111,13 @@ const acks = (since, sid) => sent.slice(since).filter((m) => (m.t === "paired_ac
   const t6 = mkTab("https://erp.example.com/", { active: true });
   const req6 = await share(t6.id);
   FakeWS.last.deliver({ t: "paired", reqId: req6, sessionId: "sess-B", chatName: "Chat B" });
+  await approveShare();
   await tick(30);
   check("setup: tab 6 belongs to Chat B", (await owner(t6.id)) === "Chat B");
   const req7 = await share(t6.id);
   sn = sent.length;
   FakeWS.last.deliver({ t: "paired", reqId: req7, sessionId: "sess-A", chatName: "Chat A", attach: true });
+  await approveShare();
   await tick(30);
   const sessB = (await F.sw(`local.get("sessions", {})`))["sess-B"];
   check("attaching a tab another chat owns transfers it (one tab, one session)",
