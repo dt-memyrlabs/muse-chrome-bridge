@@ -456,7 +456,11 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   page.focus = () => ({ kind: "element", tag: "input", isField: true, fp: "input|q", len: 3 });
   r = await cmd(A.sid, "computer", { action: "type", text: "Z", tabId: T });
   check("typing that leaves the field unchanged returns not_typed, not ok", !r.ok && r.error === "not_typed", r);
-  const inserted = () => inputs.filter((i) => i.method === "Input.insertText").length;
+  // v2.8: type sends real key events per character; the field's length
+  // grows by delivered characters (key-event text + insertText fallback).
+  const inserted = () => inputs.reduce((n, i) => n +
+    (i.method === "Input.insertText" ? (i.params.text || "").length
+     : i.method === "Input.dispatchKeyEvent" && i.params.type !== "keyUp" ? (i.params.text || "").length : 0), 0);
   page.focus = () => ({ kind: "element", tag: "input", isField: true, fp: "input|q", len: inserted() });
   r = await cmd(A.sid, "computer", { action: "type", text: "Z", tabId: T });
   check("...and typing that changes the field returns ok", r.ok, r);
