@@ -1,21 +1,26 @@
 /* Muse Chrome Bridge v2 — service worker.
  *
- * One pairing = one chat = one tab group. A chat can act only on tabs in its
- * own group, and only on sites the user permitted for that chat. Approvals come
- * only from this extension's side panel. Input is real (chrome.debugger).
+ * One pairing = one chat = one tab group. A chat can act only on tabs in
+ * its own group. Sharing a tab asks ONE confirmation in the side panel
+ * that gives the chat full control of that tab; after it, actions inside
+ * the tab are written to the panel's event record, never prompted
+ * (v2.7). Input is real (chrome.debugger).
  * Independent open-source project; not a Meta or Anthropic product.
  *
- * What gets checked before input reaches a page:
- *   - the element a click or key press will ACTIVATE (the button, not the icon
- *     inside it), read through open shadow roots and same-origin frames, and
- *     cross-checked against Chrome's accessibility tree;
- *   - anything inside a frame from another site always asks;
- *   - after an approval the target is read again and must be the same.
+ * What still gets checked before input reaches a page:
+ *   - the tab belongs to the calling chat's group — isolation is a
+ *     wall, not a prompt, and refuses outright;
+ *   - the element a click or key press will ACTIVATE (the button, not
+ *     the icon inside it), read through open shadow roots and
+ *     same-origin frames, and cross-checked against Chrome's
+ *     accessibility tree — the classification feeds the event record
+ *     and the masking of secret values, never a question;
+ *   - uploads of credential material are refused outright, no prompt.
  */
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.6.0";
+const VERSION = "2.7.0";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -746,7 +751,27 @@ async function shareableTab(tabId) {
 }
 
 async function addTab(sessionId, tabId) {
-  // Synchronous, before the first await: giving this tab to another chat
+  const s = own(await getSessions(), sessionId) ? (await getSessions())[sessionId] : null;
+  if (!s) throw fail("session_not_found", "that chat is no longer connected");
+  const tab = await shareableTab(tabId);
+  // Already this chat's tab: nothing to share, and no confirmation —
+  // the grant for it was given when it was first shared.
+  if (own(s.tabs || {}, String(tabId))) return;
+  // v2.7: the share completes only on the ONE full-control
+  // confirmation. Until the user allows it, the tab is not shared.
+  try { await confirmShare(sessionId, s.chatName, tab); }
+  catch (e) {
+    await audit(s.chatName, "tab not shared", P.hostOf(tab.url), "refused: " + ((e && e.code) || "canceled")).catch(() => {});
+    return;
+  }
+  // The tab may have moved while the card was up: share what it is now
+  // only if it is still on the site the card named.
+  const now = await chrome.tabs.get(tabId).catch(() => null);
+  if (!now || !P.isWebUrl(now.url) || P.hostOf(now.url) !== P.hostOf(tab.url)) {
+    await audit(s.chatName, "tab not shared", P.hostOf(tab.url), "refused: page_changed").catch(() => {});
+    return;
+  }
+  // Synchronous, before the next await: giving this tab to another chat
   // ends the previous chat's claim in this same tick (see attachTab) —
   // attachTab itself is only reached after awaits below, so an Allow
   // racing this transfer would otherwise settle first. The mirror is
@@ -754,14 +779,11 @@ async function addTab(sessionId, tabId) {
   const memPrev = memOwner.get(Number(tabId)) || null;
   if (memPrev && memPrev !== sessionId) {
     cancelTabWork(Number(tabId), sessionId);
-    const s = memTabs.get(memPrev);
-    if (s && s.size === 1 && s.has(Number(tabId))) cancelSessionPrompts(memPrev);
+    const ps = memTabs.get(memPrev);
+    if (ps && ps.size === 1 && ps.has(Number(tabId))) cancelSessionPrompts(memPrev);
   }
-  const s = own(await getSessions(), sessionId) ? (await getSessions())[sessionId] : null;
-  if (!s) throw fail("session_not_found", "that chat is no longer connected");
-  const tab = await shareableTab(tabId);
-  const host = P.hostOf(tab.url);
-  await attachTab(sessionId, tab);
+  const host = P.hostOf(now.url);
+  await attachTab(sessionId, now);
   await withState((st) => { if (st[sessionId]) st[sessionId].sites[host] = true; });
   await audit(s.chatName, "tab added", host, "by you");
   notifyPanel();
@@ -853,6 +875,15 @@ async function onPaired(msg) {
         ack(false, why);
         return;
       }
+      // v2.7: the tab joins only on the ONE full-control confirmation.
+      // The pair resolves after it — the relay's ack window covers the
+      // wait (SHARE_CONFIRM_MS < the relay's pair-ack timeout).
+      try { await confirmShare(msg.sessionId, (await getSessions())[msg.sessionId].chatName, tab); }
+      catch (e) {
+        await audit(msg.chatName, "tab attach", share.host, "refused: " + ((e && e.code) || "canceled"));
+        ack(false, shareRefusal(e));
+        return;
+      }
       await withState((st) => { if (st[msg.sessionId]) st[msg.sessionId].sites[share.host] = true; });
       await attachTab(msg.sessionId, tab);
       await audit(msg.chatName, "tab added", share.host, "by code");
@@ -887,6 +918,22 @@ async function onPaired(msg) {
       relaySend({ t: "revoke", sessionId: msg.sessionId }); // refuse the pairing
       await audit(msg.chatName, "pair", share ? share.host : "unknown code", "refused: " + why.split(":")[0]);
       ack(false, why);
+      return;
+    }
+    // v2.7: the pairing completes only on the ONE full-control
+    // confirmation. Until the user allows it, no session is created
+    // and the tab is not shared; the relay waits for this ack (its
+    // pair-ack window covers the confirmation's 90 s).
+    try { await confirmShare(msg.sessionId, P.clip(msg.chatName || "chat", 40), tab); }
+    catch (e) {
+      if (own(await getSessions(), msg.sessionId)) {
+        await audit(msg.chatName, "pair", "session already exists", "refused: session_exists");
+        ack(false, "session_exists: a session with this id is already connected; refusing to replace it");
+        return;
+      }
+      relaySend({ t: "revoke", sessionId: msg.sessionId }); // refuse the pairing
+      await audit(msg.chatName, "pair", share.host, "refused: " + ((e && e.code) || "canceled"));
+      ack(false, shareRefusal(e));
       return;
     }
     const chatName = P.clip(msg.chatName || "chat", 40);
@@ -1103,12 +1150,17 @@ async function cancelIfNoTabs(sessionId) {
   cancelSessionPrompts(sessionId);
 }
 
-function ask(ctx, title, detail, url) {
+function ask(ctx, title, detail, url, opts) {
   checkLive(ctx);
-  const left = ctx.job ? ctx.job.deadline - Date.now() : APPROVAL_MS;
+  // opts.ms (share confirmations) replaces the usual 60 s cap: a person
+  // reading a full-control grant gets longer, and the relay's pair-ack
+  // window is sized to match (see confirmShare).
+  const cap = (opts && opts.ms) || APPROVAL_MS;
+  const left = ctx.job ? ctx.job.deadline - Date.now() : cap;
   if (left < MIN_ASK_MS) return Promise.reject(fail("no_time_to_ask", "too little time left in this call for the user to answer; send it again"));
-  const ms = Math.min(APPROVAL_MS, left - 1000);
-  return new Promise((resolve, reject) => {
+  const ms = Math.min(cap, left - 1000);
+  let entry;
+  const promise = new Promise((resolve, reject) => {
     const id = crypto.randomUUID();
     const timer = setTimeout(() => settle(id, false, "approval_timeout"), ms);
     const tabIds = [...new Set([...(ctx.job && ctx.job.tabs ? [...ctx.job.tabs] : []),
@@ -1121,10 +1173,11 @@ function ask(ctx, title, detail, url) {
     const memSet = memTabs.get(ctx.sessionId);
     const hadTabs = memSet ? memSet.size > 0 : null;
     if (ctx.job && !tabIds.length) ctx.job.tablessHadTabs = hadTabs;
-    pending.set(id, { sessionId: ctx.sessionId, cmdId: ctx.job ? ctx.job.id : "", tabId: tabIds.length ? tabIds[0] : null, tabIds, hadTabs,
-                      chat: ctx.chat, title, detail,
-                      url: url || "", created: Date.now(), expiresAt: Date.now() + ms, timer,
-                      resolve: (ok, code) => (ok ? resolve() : reject(fail(code))) });
+    entry = { sessionId: ctx.sessionId, cmdId: ctx.job ? ctx.job.id : "", tabId: tabIds.length ? tabIds[0] : null, tabIds, hadTabs,
+              chat: ctx.chat, title, detail, shareKey: (opts && opts.shareKey) || null,
+              url: url || "", created: Date.now(), expiresAt: Date.now() + ms, timer,
+              resolve: (ok, code) => (ok ? resolve() : reject(fail(code))) };
+    pending.set(id, entry);
     chrome.action.setBadgeText({ text: String(pending.size) }).catch(() => {});
     chrome.action.setBadgeBackgroundColor({ color: "#d97706" }).catch(() => {});
     chrome.notifications.create("mbb-" + id, {
@@ -1133,6 +1186,44 @@ function ask(ctx, title, detail, url) {
     }).catch(() => {});
     notifyPanel();
   }).then(() => checkLive(ctx));
+  if (entry) entry.promise = promise;
+  return promise;
+}
+
+/* ------------------------------------------------- v2.7: share = consent */
+// Daniel's rule (2026-10-28): sharing a tab with a chat IS the consent
+// for that tab. The share itself now carries ONE confirmation — the card
+// below, in plain words — and after it, no action inside that tab asks
+// again: clicks, typing (password fields included), Enter, submits,
+// uploads and new sites all proceed. What used to prompt is written to
+// the panel's event record instead (noteSharedAction): the record
+// stays, the questions go. The walls are unchanged and never prompted
+// anyway: per-chat isolation, read-side redaction, and the outright
+// refusal of credential-store uploads.
+const SHARE_CONFIRM_MS = 90000; // the relay waits 100 s for the pair ack
+function confirmShare(sessionId, chat, tab) {
+  // Exactly one card per share: a second landing for the same tab+chat
+  // while a card is up joins the same answer instead of stacking cards.
+  const key = sessionId + ":" + tab.id;
+  for (const p of pending.values()) if (p.shareKey === key && p.promise) return p.promise;
+  const host = P.hostOf(tab.url);
+  return ask({ sessionId, chat, tabId: tab.id, job: null },
+    `Give "${chat}" full control of this tab?`,
+    `On ${host}, "${chat}" will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.`,
+    tab.url, { ms: SHARE_CONFIRM_MS, shareKey: key });
+}
+// The nack text when a share's confirmation does not complete.
+function shareRefusal(e) {
+  const code = (e && e.code) || "canceled";
+  if (code === "denied_by_user") return "denied_by_user: the user did not confirm giving this chat full control of the tab. Ask them to share the page again and tap Allow.";
+  if (code === "approval_timeout") return "approval_timeout: the full-control confirmation in the side panel was not answered in time. Ask the user to share the page again.";
+  return "share_not_confirmed: the full-control confirmation for this tab did not complete (" + code + "). Ask the user to share the page again.";
+}
+// An action that would once have opened a prompt is recorded in the
+// panel's event log instead, with the same words the prompt would have
+// used, and proceeds.
+async function noteSharedAction(ctx, title, detail) {
+  await audit(ctx.chat, title, detail, "no prompt: full control");
 }
 function settle(id, allow, code) {
   const p = pending.get(id);
@@ -1331,8 +1422,11 @@ async function sitePermitted(ctx, host) {
 }
 async function permitSite(ctx, host, why) {
   if (await sitePermitted(ctx, host)) return;
-  await ask(ctx, `Let "${ctx.chat}" use ${host}?`, why, "https://" + host + "/");
+  // v2.7: a shared tab reaching a new site no longer asks — the share's
+  // one confirmation already covered it. The site is granted and the
+  // first use is written to the event record.
   await withState((s) => { if (s[ctx.sessionId]) s[ctx.sessionId].sites[host] = true; });
+  await audit(ctx.chat, "site allowed", `${host} — ${why}`, "no prompt: full control");
 }
 
 // The tab this chat last worked in (opened, read, clicked, typed). A call with
@@ -1358,8 +1452,8 @@ async function resolveTab(ctx, tabId, { needSite = true, allowNonWeb = false, wh
     if (!tab) throw fail("no_tab");
   }
   if (!(await inSession(ctx, tab.id))) throw fail("tab_not_shared", "that tab is not one of this chat's tabs");
-  // Register the tab before any prompt below (permitSite), so removing or
-  // transferring the tab while a prompt is open cancels this command.
+  // Register the tab before the site grant below (permitSite), so
+  // removing or transferring the tab cancels this command.
   noteJobTab(ctx, tab.id);
   // A navigation still committing (first load, or a move to another site):
   // wait for it (bounded) instead of acting on a document that is leaving.
@@ -2010,9 +2104,9 @@ async function focusInfo(tab, host) {
       const fieldRole = ["textbox", "searchbox", "combobox", "textfield"].includes(role);
       // An accessibility field role alone does not make a field: a
       // non-editable div with role="textbox" is a disguised control, and
-      // giving it the field exemption let Enter reach it with no prompt
-      // while a click on it prompted. Only a genuine field keeps the
-      // exemption — the probe's isField, which means input/textarea/
+      // giving it the field exemption let Enter reach it unclassified
+      // while a click on it was classified. Only a genuine field keeps
+      // the exemption — the probe's isField, which means input/textarea/
       // select or contenteditable — and any other field-role element is
       // actionable instead (those roles are all in ACTION_ROLES).
       const genuineField = !!f.isField || !!f.isContentEditable ||
@@ -2081,18 +2175,15 @@ async function sendKey(tabId, k) {
 }
 const isPaste = (k) => (k.key.toLowerCase() === "v" && (k.modifiers & (2 | 4))) || (k.key === "Insert" && (k.modifiers & 8));
 
-// A mouse press at (x, y), gated on what it will activate. After an approval
-// the point is read again and must hold the same element.
+// A mouse press at (x, y), classified by what it will activate. v2.7:
+// a risky classification is written to the event record and the press
+// proceeds — the tab is shared, and the share was the consent. The
+// covered-target refusal is not a prompt and stays.
 async function gatedPress(ctx, tab, host, x, y, refBackend, what, count, run) {
   const d = await analyzePoint(tab, host, x, y, refBackend);
   if (d.covered) throw fail("target_covered", "another element covers that one at its centre; scroll, close the overlay, or use a coordinate");
   const c = P.classifyTarget(d);
-  if (c.ask) {
-    await ask(ctx, count > 1 ? `${what} (${count} times)` : what, `${P.describeTarget(d)} on ${host}. ${c.reason}`, tab.url);
-    await recheck(ctx, tab);
-    const again = await analyzePoint(tab, host, x, y, refBackend);
-    if (again.fp2 !== d.fp2 || again.covered) throw fail("target_changed", "the element under that point changed while the user was deciding");
-  }
+  if (c.ask) await noteSharedAction(ctx, count > 1 ? `${what} (${count} times)` : what, `${P.describeTarget(d)} on ${host}. ${c.reason}`);
   checkLive(ctx);
   await run();
   return d;
@@ -2102,8 +2193,10 @@ async function gatedPress(ctx, tab, host, x, y, refBackend, what, count, run) {
 // password fields and blind spots; payment fields get the same treatment.
 // The page probe's isPay() result reaches the worker as f.isPayField
 // (f.isPay is accepted too, for probe-shaped callers that use that name).
-// The returned classification asks, and both callers mask the typed value
-// in the prompt (and, for the type path, in the audit line) when it asks.
+// The classification marks the secret fields: callers mask the typed
+// value in the event record and the audit line when it is set. (v2.7:
+// the classification no longer opens a prompt; it feeds the record and
+// the masking, which are unchanged.)
 function classifyTypingPaid(f) {
   const c = P.classifyTyping(f);
   if (c.ask || !f) return c;
@@ -2112,8 +2205,11 @@ function classifyTypingPaid(f) {
 }
 const isPayFocus = (f) => !!(f && (f.isPayField || f.isPay));
 
-// Key presses, gated one by one: Enter/Space on whatever has focus at that
-// moment, printable keys into password fields, paste always.
+// Key presses, classified one by one: Enter/Space on whatever has focus
+// at that moment, printable keys into password fields, paste. v2.7: a
+// classification that would once have asked is written to the event
+// record (once per kind+focus per call, as the prompts were deduped)
+// and the key proceeds.
 async function pressKeysGated(ctx, tab, host, spec, repeat) {
   const keys = P.parseKeys(spec);
   const reps = clamp(Number(repeat) || 1, 1, 100);
@@ -2121,31 +2217,28 @@ async function pressKeysGated(ctx, tab, host, spec, repeat) {
   for (let r = 0; r < reps; r++) seq.push(...keys);
   const times = (pred) => seq.filter(pred).length;
   const typed = seq.filter(P.isTypingKey).map((k) => k.text).join("");
-  const approved = new Set();
+  const noted = new Set();
   for (const k of seq) {
     await recheck(ctx, tab);
     const act = P.isActivationKey(k), typ = P.isTypingKey(k), paste = isPaste(k);
     if (act || typ || paste) {
       const f = await focusInfo(tab, host);
-      const asks = [];
-      if (paste) asks.push(["paste", "Paste from your clipboard", "Your clipboard may hold a password or other private text."]);
+      const notes = [];
+      if (paste) notes.push(["paste", "Paste from your clipboard", "Your clipboard may hold a password or other private text."]);
       if (act) {
         const c = P.classifyActivation(f, P.keyName(k));
         const n = times((x) => x.key === k.key);
-        if (c.ask) asks.push(["act:" + k.key, `Press ${P.keyName(k)}${n > 1 ? ` (${n} times in this call)` : ""}`, c.reason]);
+        if (c.ask) notes.push(["act:" + k.key, `Press ${P.keyName(k)}${n > 1 ? ` (${n} times in this call)` : ""}`, c.reason]);
       }
       if (typ && !paste) {
         const c = classifyTypingPaid(f);
-        if (c.ask) asks.push(["type", f.isPassword ? "Type into a password field" : isPayFocus(f) ? "Type into a payment field" : "Type where Muse cannot see the field", `${P.shownTyping(typed, true)}. ${c.reason}`]);
+        if (c.ask) notes.push(["type", f.isPassword ? "Type into a password field" : isPayFocus(f) ? "Type into a payment field" : "Type where Muse cannot see the field", `${P.shownTyping(typed, true)}. ${c.reason}`]);
       }
-      for (const [kind, title, reason] of asks) {
+      for (const [kind, title, reason] of notes) {
         const key = kind + "|" + f.fp2;
-        if (approved.has(key)) continue;
-        await ask(ctx, title, `${P.describeTarget(f)} on ${host}. ${reason}`, tab.url);
-        await recheck(ctx, tab);
-        const f2 = await focusInfo(tab, host);
-        if (f2.fp2 !== f.fp2) throw fail("target_changed", "focus moved while the user was deciding");
-        approved.add(key);
+        if (noted.has(key)) continue;
+        await noteSharedAction(ctx, title, `${P.describeTarget(f)} on ${host}. ${reason}`);
+        noted.add(key);
       }
     }
     checkLive(ctx);
@@ -2239,15 +2332,17 @@ TOOLS.tabs_close = async (ctx, a) => {
   if (!ids.length || ids.some((id) => !Number.isInteger(id))) throw fail("bad_request", "tabIds: [numbers]");
   for (const id of ids) noteJobTab(ctx, id);
   const s = (await getSessions())[ctx.sessionId];
-  const toAsk = [];
+  const ungranted = [];
   for (const id of ids) {
     const t = await chrome.tabs.get(id).catch(() => null);
     if (!t || !(await inSession(ctx, t.id))) throw fail("tab_not_shared");
     const blank = !t.url || t.url === "about:blank";
-    if (!blank && !(P.isWebUrl(t.url) && own(s.sites, P.hostOf(t.url)))) toAsk.push(P.isWebUrl(t.url) ? P.hostOf(t.url) : "a browser page");
+    if (!blank && !(P.isWebUrl(t.url) && own(s.sites, P.hostOf(t.url)))) ungranted.push(P.isWebUrl(t.url) ? P.hostOf(t.url) : "a browser page");
   }
-  if (toAsk.length) {
-    await ask(ctx, `Close ${toAsk.length === 1 ? "a tab" : toAsk.length + " tabs"} on a site this chat was not given`, toAsk.join(", "), "");
+  // v2.7: closing one of the chat's own tabs never asks, even on a site
+  // it reached by drift; the close is recorded like any other.
+  if (ungranted.length) {
+    await noteSharedAction(ctx, `Close ${ungranted.length === 1 ? "a tab" : ungranted.length + " tabs"} on a site this chat was not given`, ungranted.join(", "));
   }
   checkLive(ctx);
   const still = [];
@@ -2292,8 +2387,8 @@ TOOLS.navigate = async (ctx, a) => {
   if (!P.isWebUrl(full)) throw fail("bad_url", "only http and https");
   const host = P.hostOf(full);
   if (!host) throw fail("bad_url");
-  // Register the tab being navigated before the site prompt below, so
-  // removing that tab while the prompt is open cancels this command.
+  // Register the tab being navigated before the site grant below, so
+  // removing that tab cancels this command.
   if (a.tabId != null) noteJobTab(ctx, Number(a.tabId));
   await permitSite(ctx, host, `Open ${P.clip(full, 120)}`);
   let tabId, prev = "about:blank";
@@ -2315,12 +2410,14 @@ TOOLS.navigate = async (ctx, a) => {
     tabId = tab.id;
   } else {
     checkLive(ctx);
-    // A tabless site prompt for this call was just answered. If the
-    // chat held a tab when the prompt opened and holds none now, its
-    // tabs were unshared while the prompt was open: do not mint it a
-    // fresh tab. Judged from the mirror first (it moves synchronously
-    // with a removal); stored state is the fallback when the mirror
-    // never knew this chat.
+    // Prompt-era guard, kept as a fail-closed net: a tabless site
+    // prompt for this call was just answered, the chat held a tab when
+    // the prompt opened and holds none now — do not mint it a fresh
+    // tab. Under v2.7 no tabless prompt opens (permitSite grants and
+    // records), so tablessHadTabs is never set and this is inert; it
+    // stays in case a tabless prompt ever returns. Judged from the
+    // mirror first (it moves synchronously with a removal); stored
+    // state is the fallback when the mirror never knew this chat.
     if (ctx.job && ctx.job.tablessHadTabs === true) {
       const set = memTabs.get(ctx.sessionId);
       const left = set ? set.size : tabIdsOf((await getSessions())[ctx.sessionId]).length;
@@ -2498,7 +2595,7 @@ async function shotProbeSens(tab, host) {
     frame: !!((shot && shot.crossOriginFrame) || fromDom.frame),
   };
 }
-// The prompt phrase for a sensitivity reading; "" when the page is clean.
+// The event-record phrase for a sensitivity reading; "" when clean.
 // Single-flag phrases keep their historic wording exactly.
 function shotKind(sens) {
   const parts = [];
@@ -2512,31 +2609,23 @@ function shotKind(sens) {
 async function shoot(ctx, a, region, via) {
   const tab = await resolveTab(ctx, a.tabId);
   const host = P.hostOf(tab.url);
-  // Viewport and region are settled BEFORE the sensitivity gate, so the
-  // gate's final probe (below) is the last page read before capture.
+  // Viewport and region are settled BEFORE the sensitivity probe, so
+  // the probe (below) is the last page read before capture.
   const v = await viewport(tab.id);
   let scale = clamp(Number(a.scale) || 1, 0.1, region ? 3 : 1);
   if (region && !(region.every(Number.isFinite) && region[2] > region[0] && region[3] > region[1])) throw fail("bad_region", "[x0, y0, x1, y1] with x1 > x0 and y1 > y0");
   const clip = region
     ? { x: v.x + region[0], y: v.y + region[1], width: region[2] - region[0], height: region[3] - region[1] }
     : { x: v.x, y: v.y, width: v.w, height: v.h };
-  // Sensitivity gate, re-probed until the reading is stable (TOCTOU): the
-  // page can change while an approval prompt waits, so a single early probe
-  // is not enough. Loop: probe; if clean, capture follows immediately; if
-  // sensitive and this exact classification was already approved, capture
-  // follows immediately after THIS probe; otherwise ask, recheck, and
-  // probe again. A page that keeps changing its classification after 3
-  // approvals is refused instead of chased forever.
-  let approved = "";
-  for (let asks = 0; ; asks++) {
-    const kind = shotKind(await shotProbeSens(tab, host));
-    if (!kind || kind === approved) break;
-    if (asks >= 3) throw fail("target_changed", "the page kept changing while the user was deciding; try the screenshot again");
-    await ask(ctx, "Screenshot a page with " + kind,
-      `The page on ${host} has ${kind}. A screenshot shows everything visible on the page, including what is typed into those fields.`, tab.url);
-    await recheck(ctx, tab);
-    approved = kind;
-  }
+  // Sensitivity reading: the page is probed once, immediately before
+  // capture. v2.7: a sensitive reading no longer asks — the screenshot
+  // proceeds and the reading is written to the event record, so the
+  // trail of what was captured survives. (The panel's live view still
+  // hides sensitive pages outright; that is not a prompt and is
+  // unchanged.)
+  const kind = shotKind(await shotProbeSens(tab, host));
+  if (kind) await noteSharedAction(ctx, "Screenshot a page with " + kind,
+    `The page on ${host} has ${kind}. A screenshot shows everything visible on the page, including what is typed into those fields.`);
   // Chrome draws only the tab in front of each window. A background tab never
   // produces a frame, so its capture would hang: give up quickly and say why.
   const background = !tab.active;
@@ -2699,10 +2788,7 @@ TOOLS.computer = async (ctx, a) => {
       const de = await analyzePoint(tab, host, x, y, null);
       const cs = P.classifyTarget(ds), ce = P.classifyTarget(de);
       if (cs.ask || ce.ask) {
-        await ask(ctx, "Drag", `From ${P.describeTarget(ds)} to ${P.describeTarget(de)} on ${host}. ${(cs.ask ? cs : ce).reason}`, tab.url);
-        await recheck(ctx, tab);
-        const s2 = await analyzePoint(tab, host, sx, sy, null), e2 = await analyzePoint(tab, host, x, y, null);
-        if (s2.fp2 !== ds.fp2 || e2.fp2 !== de.fp2) throw fail("target_changed", "the page changed while the user was deciding");
+        await noteSharedAction(ctx, "Drag", `From ${P.describeTarget(ds)} to ${P.describeTarget(de)} on ${host}. ${(cs.ask ? cs : ce).reason}`);
       }
       checkLive(ctx);
       await cursorGo(tab.id, sx, sy, false);
@@ -2739,10 +2825,10 @@ TOOLS.computer = async (ctx, a) => {
       }
       const c = blindAfterClick ? { ask: false } : classifyTypingPaid(f);
       if (c.ask) {
-        await ask(ctx, f.isPassword ? "Type into a password field" : isPayFocus(f) ? "Type into a payment field" : "Type where Muse cannot see the field", `${P.shownTyping(text, true)} into ${P.describeTarget(f)} on ${host}. ${c.reason}`, tab.url);
-        await recheck(ctx, tab);
-        const f2 = await focusInfo(tab, host);
-        if (f2.fp2 !== f.fp2) throw fail("target_changed", "focus moved while the user was deciding");
+        // v2.7: typing into a password or payment field proceeds like
+        // everything else in a shared tab — and is recorded, with the
+        // value masked to its length exactly as the prompt showed it.
+        await noteSharedAction(ctx, f.isPassword ? "Type into a password field" : isPayFocus(f) ? "Type into a payment field" : "Type where Muse cannot see the field", `${P.shownTyping(text, true)} into ${P.describeTarget(f)} on ${host}. ${c.reason}`);
       }
       checkLive(ctx);
       await ensureFocusEmulation(tab.id);
@@ -2772,11 +2858,11 @@ TOOLS.computer = async (ctx, a) => {
 // its frame (locateFramedEntry), and set through the point-dispatch
 // path — a real press at its top-level point focuses it in its frame,
 // and the value follows focus — never through root-world node
-// resolution. Classification, prompting and the post-approval
-// re-verification mirror TOOLS.form_input's root-world path, fact
-// for fact.
+// resolution. Classification mirrors TOOLS.form_input's root-world
+// path, fact for fact; v2.7 records a sensitive classification as an
+// event instead of prompting, in both paths.
 async function formInputFramed(ctx, tab, host, hit, a) {
-  let loc = await locateFramedEntry(tab, hit);
+  const loc = await locateFramedEntry(tab, hit);
   const d = loc.entry.d;
   if (!d || !d.isField) throw fail("not_a_field", "form_input sets text fields, checkboxes, radios and selects; click buttons with computer");
   if (!d.role && hit.role) d.role = hit.role;
@@ -2786,16 +2872,7 @@ async function formInputFramed(ctx, tab, host, hit, a) {
   const secret = cls.secret;
   if (cls.ask) {
     const title = d.isPassword ? "Fill a password field" : d.isPayField ? "Fill a payment field" : "Fill a field in a sensitive form";
-    await ask(ctx, title, `${P.shownTyping(a.value, secret)} into ${P.describeTarget(d)} on ${host}. ${cls.reason}`, tab.url);
-    await recheck(ctx, tab);
-    const loc2 = await locateFramedEntry(tab, hit);
-    const d2 = loc2.entry.d;
-    if (!d2) throw fail("target_changed");
-    const cls2 = P.classifyFormInput(d2);
-    const factKeys = ["isPayField", "isPassword", "formHasPayment", "formHasPassword", "formRiskySubmit"];
-    if (d2.fp !== d.fp || cls2.ask !== cls.ask || cls2.secret !== cls.secret ||
-        factKeys.some((k) => !!d2[k] !== !!d[k])) throw fail("target_changed");
-    loc = loc2;
+    await noteSharedAction(ctx, title, `${P.shownTyping(a.value, secret)} into ${P.describeTarget(d)} on ${host}. ${cls.reason}`);
   }
   checkLive(ctx);
   const kind = d.tag === "select" ? "select" : (d.type === "checkbox" || d.type === "radio") ? "check" : "text";
@@ -2852,20 +2929,10 @@ TOOLS.form_input = async (ctx, a) => {
   const cls = P.classifyFormInput(d);
   const secret = cls.secret;
   if (cls.ask) {
+    // v2.7: a sensitive form classification is recorded, not asked;
+    // the value stays masked in the record for secret fields.
     const title = d.isPassword ? "Fill a password field" : d.isPayField ? "Fill a payment field" : "Fill a field in a sensitive form";
-    await ask(ctx, title, `${P.shownTyping(a.value, secret)} into ${P.describeTarget(d)} on ${host}. ${cls.reason}`, tab.url);
-    await recheck(ctx, tab);
-    const d2 = await probe(tab, host, "node", {}, backend);
-    if (!d2) throw fail("target_changed");
-    await mergeAxName(d2);
-    // fp alone does not cover what the approval was FOR: compare the
-    // re-probed classification and every form fact behind it, so a page
-    // cannot swap a password field out (or turn the target into a payment
-    // field via autocomplete) while the prompt is open.
-    const cls2 = P.classifyFormInput(d2);
-    const factKeys = ["isPayField", "isPassword", "formHasPayment", "formHasPassword", "formRiskySubmit"];
-    if (d2.fp !== d.fp || cls2.ask !== cls.ask || cls2.secret !== cls.secret ||
-        factKeys.some((k) => !!d2[k] !== !!d[k])) throw fail("target_changed");
+    await noteSharedAction(ctx, title, `${P.shownTyping(a.value, secret)} into ${P.describeTarget(d)} on ${host}. ${cls.reason}`);
   }
   checkLive(ctx);
   // Seen, like every other action: the field is scrolled into view and
@@ -2886,9 +2953,9 @@ TOOLS.form_input = async (ctx, a) => {
       // frame. Focus it the way Claude in Chrome does: a real press at
       // its measured point, which the browser routes into the frame
       // and focuses there; the text then follows focus. (This press is
-      // a focus click inside an operation already classified and, when
-      // required, approved above — the same footing as the DOM.focus
-      // it replaces, not a new activation.)
+      // a focus click inside an operation already classified above —
+      // the same footing as the DOM.focus it replaces, not a new
+      // activation.)
       if (!fc) throw fail("target_changed", "that element is gone; read_page again");
       await cursorGo(tab.id, fc.x, fc.y, true);
       await clickAt(tab.id, fc.x, fc.y, "left", 1, 0);
@@ -3020,7 +3087,10 @@ TOOLS.file_upload = async (ctx, a) => {
   const d = await probe(tab, host, "node", {}, backend);
   if (!d || d.tag !== "input" || d.type !== "file") throw fail("not_a_file_input");
   const shown = paths.map((p, i) => `${displayPath(p)} (${formatUploadSize(sizes[i])})`).join(", ");
-  await ask(ctx, "Upload files", `${shown} to ${host}`, tab.url);
+  // v2.7: an ordinary upload proceeds; it is recorded with the same
+  // paths and sizes the prompt would have shown. (Credential-store
+  // paths were refused outright above, before this point, as always.)
+  await noteSharedAction(ctx, "Upload files", `${shown} to ${host}`);
   await recheck(ctx, tab);
   await cdp(tab.id, "DOM.setFileInputFiles", { files: paths, backendNodeId: backend });
   await audit(ctx.chat, "file_upload", paths.map(displayPath).join(", ") + " @ " + host, "ok");
