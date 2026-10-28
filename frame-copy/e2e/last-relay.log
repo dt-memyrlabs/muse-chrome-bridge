@@ -1,0 +1,35 @@
+[relay 10:28:51] device enrollment gate on (hello must prove the per-install secret)
+[relay 10:28:51] ws 127.0.0.1:19822  http 127.0.0.1:20822  state /tmp/frame-rig-yfmqmduy/relay-state.json
+[relay 10:28:51] WARNING: no Tailscale address found (tailscale ip -4): chat API is loopback-only
+[relay 10:28:54] device 214c47dd online
+[relay 10:28:54] pairing code issued for device 214c47dd
+[relay 10:28:54] session 36145c paired to device 214c47dd (acked)
+[relay 10:28:55] cmd 36145c tabs_context -> ok
+[relay 10:28:56] cmd 36145c computer -> ok
+[relay 10:28:56] cmd 36145c computer -> ok
+[relay 10:28:58] cmd 36145c computer -> ok
+[relay 10:28:59] cmd 36145c get_page_text -> ok
+[relay 10:29:00] cmd 36145c computer -> ok
+[relay 10:29:01] cmd 36145c computer -> ok
+[relay 10:29:02] cmd 36145c get_page_text -> ok
+[relay 10:29:02] cmd 36145c computer -> ok
+[relay 10:29:03] cmd 36145c computer -> ok
+[relay 10:29:04] cmd 36145c computer -> ok
+[relay 10:29:05] cmd 36145c get_page_text -> ok
+[relay 10:29:06] cmd 36145c find -> ok
+[relay 10:29:06] cmd 36145c find -> ok
+[relay 10:29:07] cmd 36145c find -> ok
+[relay 10:29:08] cmd 36145c computer -> ok
+[relay 10:29:08] cmd 36145c computer -> ok
+[relay 10:29:10] cmd 36145c computer -> ok
+[relay 10:29:11] cmd 36145c get_page_text -> ok
+[relay 10:29:12] cmd 36145c form_input -> ok
+[relay 10:29:13] cmd 36145c find -> ok
+[relay 10:29:13] cmd 36145c find -> ok
+[relay 10:29:14] cmd 36145c computer -> ok
+[relay 10:29:14] cmd 36145c computer -> ok
+[relay 10:29:16] cmd 36145c computer -> ok
+[relay 10:29:19] cmd 36145c computer -> ok
+[relay 10:29:19] cmd 36145c computer -> ok
+[relay 10:29:22] cmd 36145c computer -> ok
+[relay 10:29:23] cmd 36145c get_page_text -> ok
