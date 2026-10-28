@@ -133,7 +133,7 @@ async function refresh() {
       el("p", { class: "muted" }, "Paste this code into the Muse chat that should control this page:"),
       el("div", { class: "code" }, st.share.code.slice(0, 4) + "-" + st.share.code.slice(4)),
       el("p", { class: "copied" }, copied[st.share.reqId] || ""),
-      el("p", { class: "muted" }, "Using this code lets that chat use this tab's site until you disconnect the chat or remove the site."),
+      el("p", { class: "muted" }, "Using this code lets that chat take control of this tab — after you confirm once, here in this panel, that it gets full control. Stop sharing to end it."),
       el("p", { class: "muted" }, `Works once. Expires in about ${mins} min. Not connected until the chat uses it.`),
       el("div", { class: "row" },
         el("button", { onclick: () => copyText(st.share.code).then(() => { copied[st.share.reqId] = "Copied. Paste it into the Muse chat."; lastJson = ""; refresh(); }, () => {}) }, "Copy"),
