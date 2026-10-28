@@ -1,35 +1,35 @@
-[relay 10:28:51] device enrollment gate on (hello must prove the per-install secret)
-[relay 10:28:51] ws 127.0.0.1:19822  http 127.0.0.1:20822  state /tmp/frame-rig-yfmqmduy/relay-state.json
-[relay 10:28:51] WARNING: no Tailscale address found (tailscale ip -4): chat API is loopback-only
-[relay 10:28:54] device 214c47dd online
-[relay 10:28:54] pairing code issued for device 214c47dd
-[relay 10:28:54] session 36145c paired to device 214c47dd (acked)
-[relay 10:28:55] cmd 36145c tabs_context -> ok
-[relay 10:28:56] cmd 36145c computer -> ok
-[relay 10:28:56] cmd 36145c computer -> ok
-[relay 10:28:58] cmd 36145c computer -> ok
-[relay 10:28:59] cmd 36145c get_page_text -> ok
-[relay 10:29:00] cmd 36145c computer -> ok
-[relay 10:29:01] cmd 36145c computer -> ok
-[relay 10:29:02] cmd 36145c get_page_text -> ok
-[relay 10:29:02] cmd 36145c computer -> ok
-[relay 10:29:03] cmd 36145c computer -> ok
-[relay 10:29:04] cmd 36145c computer -> ok
-[relay 10:29:05] cmd 36145c get_page_text -> ok
-[relay 10:29:06] cmd 36145c find -> ok
-[relay 10:29:06] cmd 36145c find -> ok
-[relay 10:29:07] cmd 36145c find -> ok
-[relay 10:29:08] cmd 36145c computer -> ok
-[relay 10:29:08] cmd 36145c computer -> ok
-[relay 10:29:10] cmd 36145c computer -> ok
-[relay 10:29:11] cmd 36145c get_page_text -> ok
-[relay 10:29:12] cmd 36145c form_input -> ok
-[relay 10:29:13] cmd 36145c find -> ok
-[relay 10:29:13] cmd 36145c find -> ok
-[relay 10:29:14] cmd 36145c computer -> ok
-[relay 10:29:14] cmd 36145c computer -> ok
-[relay 10:29:16] cmd 36145c computer -> ok
-[relay 10:29:19] cmd 36145c computer -> ok
-[relay 10:29:19] cmd 36145c computer -> ok
-[relay 10:29:22] cmd 36145c computer -> ok
-[relay 10:29:23] cmd 36145c get_page_text -> ok
+[relay 19:14:53] device enrollment gate on (hello must prove the per-install secret)
+[relay 19:14:53] ws 127.0.0.1:19822  http 127.0.0.1:20822  state /tmp/frame-rig-dulxctkt/relay-state.json
+[relay 19:14:54] WARNING: no Tailscale address found (tailscale ip -4): chat API is loopback-only
+[relay 19:15:00] device 299a3edc online
+[relay 19:15:01] pairing code issued for device 299a3edc
+[relay 19:15:02] session 503fd2 paired to device 299a3edc (acked)
+[relay 19:15:04] cmd 503fd2 tabs_context -> ok
+[relay 19:15:04] cmd 503fd2 computer -> ok
+[relay 19:15:05] cmd 503fd2 computer -> ok
+[relay 19:15:06] cmd 503fd2 computer -> ok
+[relay 19:15:07] cmd 503fd2 get_page_text -> ok
+[relay 19:15:08] cmd 503fd2 computer -> ok
+[relay 19:15:08] cmd 503fd2 computer -> ok
+[relay 19:15:09] cmd 503fd2 get_page_text -> ok
+[relay 19:15:10] cmd 503fd2 computer -> ok
+[relay 19:15:11] cmd 503fd2 computer -> ok
+[relay 19:15:12] cmd 503fd2 computer -> ok
+[relay 19:15:13] cmd 503fd2 get_page_text -> ok
+[relay 19:15:14] cmd 503fd2 find -> ok
+[relay 19:15:14] cmd 503fd2 find -> ok
+[relay 19:15:15] cmd 503fd2 find -> ok
+[relay 19:15:16] cmd 503fd2 computer -> ok
+[relay 19:15:16] cmd 503fd2 computer -> ok
+[relay 19:15:18] cmd 503fd2 computer -> ok
+[relay 19:15:19] cmd 503fd2 get_page_text -> ok
+[relay 19:15:20] cmd 503fd2 form_input -> ok
+[relay 19:15:22] cmd 503fd2 find -> ok
+[relay 19:15:22] cmd 503fd2 find -> ok
+[relay 19:15:23] cmd 503fd2 computer -> ok
+[relay 19:15:24] cmd 503fd2 computer -> ok
+[relay 19:15:25] cmd 503fd2 computer -> ok
+[relay 19:15:28] cmd 503fd2 computer -> ok
+[relay 19:15:28] cmd 503fd2 computer -> ok
+[relay 19:15:30] cmd 503fd2 computer -> ok
+[relay 19:15:31] cmd 503fd2 get_page_text -> ok
