@@ -3,16 +3,21 @@
 
 The tree ships only a template (com.memyr.muse_bridge.json.template);
 the real manifest is personal — it contains this user's absolute path
-to relay_host.py and their own extension's ID — so it is generated
+to the host launcher and their own extension's ID — so it is generated
 here, at install time, and never committed.
 
 Usage:
-  python3 install_native_host.py <extension-id>
+  python3 install_native_host.py                  # ID worked out for you
+  python3 install_native_host.py <extension-id>   # or give it explicitly
   python3 install_native_host.py --extension-id <extension-id>
 
-The extension ID is shown on chrome://extensions under the unpacked
-extension (32 letters). A full chrome-extension://<id>/ origin is
-also accepted. Options:
+With no ID, the installer computes the one Chrome assigns to the
+unpacked extension in this tree's extension/ folder: an unpacked
+extension's ID is a hash of its folder path, so it is knowable in
+advance and there is nothing to look up or copy. An explicit ID (the
+one shown on chrome://extensions, 32 letters; a full
+chrome-extension://<id>/ origin is also accepted) always wins — use
+it if the extension folder lives somewhere else. Options:
   --home DIR        home directory to install under
                     (default: $HOME, or the OS home directory)
   --output-dir DIR  write the manifest directly into DIR instead of
@@ -34,6 +39,7 @@ Where the manifest is written (per-user, Chrome):
              com.memyr.muse_bridge.json
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -43,6 +49,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOST_NAME = "com.memyr.muse_bridge"
 TEMPLATE = os.path.join(HERE, HOST_NAME + ".json.template")
 RELAY_HOST = os.path.join(HERE, "relay_host.py")
+# On Windows Chrome starts the host by executing the manifest's "path"
+# directly — it cannot run a .py file. Pointed at relay_host.py, a fresh
+# install made every "Start relay" click open the file in whatever app
+# .py is associated with (VS Code on Daniel's second PC, 2026-10-28)
+# and the relay never started. The installer therefore generates this
+# small launcher next to relay_host.py and registers IT on Windows.
+# Daniel's first PC only worked because a hand-made launcher already
+# existed there; the shipped installer never created one.
+RELAY_HOST_BAT = os.path.join(HERE, "relay_host.bat")
+EXTENSION_DIR = os.path.normpath(os.path.join(HERE, "..", "extension"))
 
 # Per-user NativeMessagingHosts directory, relative to the home dir.
 TARGETS = {
@@ -76,6 +92,30 @@ def clean_extension_id(raw):
             "error: extension ID must be the ID shown on "
             "chrome://extensions (letters and digits, no spaces)")
     return ext_id
+
+
+def compute_extension_id(path, platform):
+    """The ID Chrome assigns an unpacked extension: SHA-256 of the
+    extension folder's absolute path (UTF-16LE on Windows, UTF-8
+    elsewhere), first 32 hex digits, each digit mapped 0-9a-f -> a-p.
+    Verified against real Chrome IDs for two paths on 2026-10-28."""
+    raw = path.encode("utf-16-le") if platform == "windows" \
+        else path.encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:32]
+    return "".join(chr(ord("a") + int(c, 16)) for c in digest)
+
+
+def write_windows_launcher():
+    """Generate relay_host.bat, pinned to the Python running this
+    installer (no PATH or py-launcher dependence), and return its path."""
+    lines = [
+        "@echo off",
+        f'"{sys.executable}" "%~dp0relay_host.py" %*',
+        "",
+    ]
+    with open(RELAY_HOST_BAT, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n".join(lines))
+    return RELAY_HOST_BAT
 
 
 def build_manifest(ext_id, host_path=RELAY_HOST):
@@ -128,15 +168,18 @@ def main(argv=None):
                     help="target OS (default: auto-detect)")
     args = ap.parse_args(argv)
 
-    raw_id = args.extension_id_opt or args.extension_id
-    if not raw_id:
-        ap.error("an extension ID is required "
-                 "(see chrome://extensions)")
-    ext_id = clean_extension_id(raw_id)
-
     platform = args.platform or detect_platform()
     platform = {"win32": "windows", "darwin": "macos"}.get(
         platform, platform)
+
+    raw_id = args.extension_id_opt or args.extension_id
+    if raw_id:
+        ext_id = clean_extension_id(raw_id)
+    else:
+        ext_id = compute_extension_id(EXTENSION_DIR, platform)
+        print(f"extension ID for {EXTENSION_DIR}: {ext_id} "
+              f"(computed from the folder path; pass --extension-id "
+              f"if the extension lives elsewhere)")
 
     home = args.home or os.environ.get("HOME") or os.path.expanduser("~")
     if args.output_dir:
@@ -146,7 +189,17 @@ def main(argv=None):
     os.makedirs(out_dir, exist_ok=True)
     manifest_path = os.path.join(out_dir, HOST_NAME + ".json")
 
-    manifest = build_manifest(ext_id)
+    if platform == "windows":
+        # Chrome executes the manifest path itself: register the
+        # launcher, never the .py file. Written for real on a Windows
+        # run; when preparing a manifest elsewhere (--platform /
+        # --output-dir) point at the launcher name the Windows run
+        # will generate.
+        host_path = write_windows_launcher() if sys.platform == "win32" \
+            else RELAY_HOST_BAT
+        manifest = build_manifest(ext_id, host_path=host_path)
+    else:
+        manifest = build_manifest(ext_id)
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
