@@ -45,9 +45,18 @@ async function share(tabId) {
   await tick(10);
   return req.reqId;
 }
+// v2.7: a share lands only on the ONE full-control confirmation.
+async function approveShare() {
+  for (let i = 0; i < 200; i++) {
+    const sp = ((await panel("state")).prompts || []).find((p) => /full control/i.test(p.title));
+    if (sp) { await panel("approve", { id: sp.id }); return; }
+    await tick(5);
+  }
+}
 async function pair(tabId, sid, name) {
   const req = await share(tabId);
   FakeWS.last.deliver({ t: "paired", reqId: req, sessionId: sid, chatName: name });
+  await approveShare();
   await tick(30);
 }
 const chatState = async (sid) => (await panel("state")).chats.find((c) => c.sessionId === sid);
