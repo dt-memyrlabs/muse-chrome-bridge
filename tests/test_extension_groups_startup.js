@@ -31,12 +31,21 @@ const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
     for (const v of Object.values(all)) if (v.tabs && Object.prototype.hasOwnProperty.call(v.tabs, String(tabId))) return v.chatName;
     return null;
   }
+  // v2.7: a share lands only on the ONE full-control confirmation.
+  async function approveShare() {
+    for (let i = 0; i < 200; i++) {
+      const sp = ((await panel("state")).prompts || []).find((p) => /full control/i.test(p.title));
+      if (sp) { await panel("approve", { id: sp.id }); return; }
+      await tick(5);
+    }
+  }
   async function pair(tabId, sid, name, attach) {
     await panel("share", { tabId });
     const req = sent.filter((m) => m.t === "pair_request").pop();
     FakeWS.last.deliver({ t: "pair_code", reqId: req.reqId, code: "ABCD2345", expiresIn: 300 });
     await tick(10);
     FakeWS.last.deliver({ t: "paired", reqId: req.reqId, sessionId: sid, chatName: name, ...(attach ? { attach: true } : {}) });
+    await approveShare();
     await tick(40);
   }
 
