@@ -217,6 +217,20 @@ function renderRest(st) {
     head.style.alignItems = "center";
     head.style.gap = "8px";
     block.append(head);
+    // A shared tab that never landed in this chat's tab group must say
+    // so, in plain words, with Chrome's reason \u2014 not sit there looking
+    // like a healthy chat (Daniel, 2026-10-28).
+    if (x.tabs > 0 && x.groupMissing) {
+      let line;
+      if (x.groupWindowType && x.groupWindowType !== "normal") {
+        line = "Tab group can't form in a " + x.groupWindowType + " window \u2014 Chrome only allows tab groups in normal windows. This chat still controls its tabs.";
+      } else if (x.groupStopped) {
+        line = "Tab group missing \u2014 grouping kept failing" + (x.groupError ? " (" + x.groupError + ")" : "") + ", so the bridge stopped retrying. This chat still controls its tabs.";
+      } else {
+        line = "Tab group missing" + (x.groupError ? " \u2014 " + x.groupError : "") + ". This chat still controls its tabs; the bridge keeps retrying.";
+      }
+      block.append(el("p", { class: "muted" }, line));
+    }
     // The live view: what this chat's tab looks like while it works. On a
     // page the screenshot gate calls sensitive there is no picture at
     // all — the note says why instead.
