@@ -45,12 +45,22 @@ async function waitPrompt(n = 1) {
   for (let i = 0; i < 300; i++) { const p = await pendingPrompts(); if (p.length >= n) return p; await tick(5); }
   return [];
 }
+// v2.7: a share lands only on the ONE full-control confirmation.
+async function approveShare() {
+  for (let i = 0; i < 200; i++) {
+    const sp = (await pendingPrompts()).find((p) => /full control/i.test(p.title));
+    if (sp) { await panel("approve", { id: sp.id }); return sp; }
+    await tick(5);
+  }
+  return null;
+}
 async function pair(tabId, sid, name) {
   await panel("share", { tabId });
   const req = sent.filter((m) => m.t === "pair_request").pop();
   FakeWS.last.deliver({ t: "pair_code", reqId: req.reqId, code: "ABCD2345", expiresIn: 300 });
   await tick(10);
   FakeWS.last.deliver({ t: "paired", reqId: req.reqId, sessionId: sid, chatName: name });
+  await approveShare();
   await tick(30);
 }
 const mouseEvts = (tabId) => inputs.filter((i) => i.tabId === tabId && i.method === "Input.dispatchMouseEvent");
@@ -195,14 +205,13 @@ const frameState = {
   check("...and setting the state it already holds presses nothing",
         r.ok, r);
 
-  /* ---- 9. the framed password field prompts first -------------------- */
-  const fpCmd = cmdStart("sess-A", "form_input", { ref: pwdRef, value: "s3cret" });
-  const pr = await waitPrompt(1);
-  check("form_input into the framed password field asks first (same gate as the top frame)",
-        pr.length === 1 && /Fill a password field/.test(pr[0].title), pr);
-  if (pr.length) await panel("approve", { id: pr[0].id });
-  r = await result(fpCmd);
-  check("...and completes after approval", r.ok, r);
+  /* ---- 9. the framed password field: no prompt under v2.7 ----------- */
+  r = await cmd("sess-A", "form_input", { ref: pwdRef, value: "s3cret" });
+  check("form_input into the framed password field proceeds with no prompt (v2.7: the share was the consent)",
+        r.ok && (await pendingPrompts()).length === 0, r);
+  const fillEv = (await panel("state")).audit.filter((a) => /Fill a password field/.test(a.action));
+  check("...and the fill is written to the event record, value masked to its length",
+        fillEv.length === 1 && fillEv[0].outcome === "no prompt: full control" && !/s3cret/.test(fillEv[0].detail), fillEv);
 
   /* ---- 10. a framed ref whose element changed refuses ---------------- */
   frameState.entries[0] = { ...frameState.entries[0], fp: "div|changed" };
