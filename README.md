@@ -12,6 +12,14 @@ the page, click, type, and scroll — while you watch it happen. Nothing
 is shared until you generate a code or drag a tab into a chat's group,
 and closing the tab ends the connection.
 
+## Install (Windows)
+
+Download **[Install Muse Chrome Bridge.cmd](https://raw.githubusercontent.com/dt-memyrlabs/muse-chrome-bridge/main/Install%20Muse%20Chrome%20Bridge.cmd)** (also in this repo's root, and on the [v2.4.1 release](https://github.com/dt-memyrlabs/muse-chrome-bridge/releases/tag/v2.4.1) page) and double-click it. It brings its own Python — nothing to install first, no extension ID to type, no scripts to run. It sets everything up, starts the relay, and opens chrome://extensions plus the extension folder.
+
+Your one step, which Chrome reserves for the user: in that tab, turn on **Developer mode** (top right), click **Load unpacked**, and pick the folder it opened. Then open the Muse Chrome Bridge panel and pair with a code from your chat.
+
+The manual route (Python 3.10+ already installed) is under [Setup](#setup).
+
 ## What it does
 
 - **Pair by code.** One code, one tab, one chat. Codes work once and
