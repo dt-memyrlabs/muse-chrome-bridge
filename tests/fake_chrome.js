@@ -39,12 +39,23 @@ function install({ relayUrl, fakeSocket = true } = {}) {
     tabsUpdated: event(), tabsRemoved: event(), groupsRemoved: event(), groupsUpdated: event(),
     runtimeMsg: event(), tabsAttached: event(), tabsDetached: event(),
     alarm: event(), installed: event(), startup: event(), notifClicked: event(), dbgDetach: event(),
-    tabsCreated: event(), tabsActivated: event(), winFocus: event(),
+    tabsCreated: event(), tabsActivated: event(), winFocus: event(), dbgEvent: event(),
   };
   // Test knob for chrome.tabs.group failures beyond the window-type
   // refusal below: a function ({tabIds, groupId, createProperties}) that
   // returns an Error to throw, or null to let the call proceed.
   const groupBox = { hook: null };
+  // Test knob for CDP failures (v2.7.2 transport tests): a function
+  // ({tabId, method, params}) that returns an Error to throw from
+  // chrome.debugger.sendCommand, or null to let the call proceed.
+  const cdpBox = { hook: null };
+  const dbgAttach = { count: 0 }; // chrome.debugger.attach calls seen
+  // Ordered record of the visual layer, for hide-for-capture sequence
+  // assertions: {kind:"cursor"|"pill", tabId, arg} for every scripting
+  // call that drives an indicator, {kind:"capture", tabId} for every
+  // Page.captureScreenshot, {kind:"captureView", windowId} for every
+  // captureVisibleTab.
+  const visualLog = [];
   let nextOwnWindow = 5000; // windows created around an existing tab
   const pillOf = {};   // tabId -> chat name the pill shows (set through chrome.scripting)
   const cursorOf = {}; // tabId -> last cursor command the worker sent (through chrome.scripting)
@@ -114,6 +125,8 @@ function install({ relayUrl, fakeSocket = true } = {}) {
   async function sendCommand(target, method, params = {}) {
     const t = tabs.get(target.tabId);
     cdpLog.push({ tabId: target.tabId, method, params });
+    if (method === "Page.captureScreenshot") visualLog.push({ kind: "capture", tabId: target.tabId });
+    if (cdpBox.hook) { const err = cdpBox.hook({ tabId: target.tabId, method, params }); if (err) throw err; }
     switch (method) {
       case "Page.getFrameTree": return { frameTree: { frame: { id: "f" + target.tabId, loaderId: "L:" + (t && t.url), url: t && t.url } } };
       case "Page.createIsolatedWorld": return { executionContextId: ++ctxSeq };
@@ -212,6 +225,7 @@ function install({ relayUrl, fakeSocket = true } = {}) {
       goBack: async () => {}, goForward: async () => {},
       captureVisibleTab: async (windowId, opts) => {
         captures.push({ windowId, at: Date.now() });
+        visualLog.push({ kind: "captureView", windowId });
         if (typeof page.captureView === "function") return page.captureView(windowId, opts);
         return "data:image/jpeg;base64," + page.shot;
       },
@@ -232,8 +246,9 @@ function install({ relayUrl, fakeSocket = true } = {}) {
       onUpdated: { addListener: (f) => E.groupsUpdated.addListener(f) },
     },
     debugger: {
-      attach: async () => {}, detach: async () => {}, sendCommand, getTargets: async () => [],
+      attach: async () => { dbgAttach.count++; }, detach: async () => {}, sendCommand, getTargets: async () => [],
       onDetach: { addListener: (f) => E.dbgDetach.addListener(f) },
+      onEvent: { addListener: (f) => E.dbgEvent.addListener(f) },
     },
     webNavigation: {
       // The tab's frame inventory. Tests set page.frames (an array, or a
@@ -266,8 +281,8 @@ function install({ relayUrl, fakeSocket = true } = {}) {
         if (func) {
           // The pill and the cursor are driven the same way; tell them apart
           // by the page-global each func drives, as the real page would.
-          if (String(func).includes("__museBridgeCursor")) cursorOf[target.tabId] = args && args[0];
-          else pillOf[target.tabId] = args && args[0];
+          if (String(func).includes("__museBridgeCursor")) { cursorOf[target.tabId] = args && args[0]; visualLog.push({ kind: "cursor", tabId: target.tabId, arg: args && args[0] }); }
+          else { pillOf[target.tabId] = args && args[0]; visualLog.push({ kind: "pill", tabId: target.tabId, arg: args && args[0] }); }
         }
         return [{ result: null }];
       },
@@ -326,7 +341,7 @@ function install({ relayUrl, fakeSocket = true } = {}) {
   const panel = (kind, extra, sender = PANEL) => new Promise((resolve) => {
     E.runtimeMsg.fire({ kind, ...(extra || {}) }, sender, resolve);
   });
-  return { tabs, groups, sent, cdpLog, inputs, notifications, windowTypes, pillOf, cursorOf, captures, E, page, mkTab, setGroup, setUrl, mkGroup, moveToWindow, FakeWS, groupBox,
+  return { tabs, groups, sent, cdpLog, inputs, notifications, windowTypes, pillOf, cursorOf, captures, E, page, mkTab, setGroup, setUrl, mkGroup, moveToWindow, FakeWS, groupBox, cdpBox, dbgAttach, visualLog,
            setLastFocusedWindow: (id) => { lastFocusedWindowId = id; },
            panel, sessionStore, localStore, sw: (expr) => vm.runInThisContext(expr) };
 }
