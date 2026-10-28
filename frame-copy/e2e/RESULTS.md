@@ -132,3 +132,7 @@ contains no framed descendants on either build. The fake-chrome harness
 suites synthesize that path; real-Chromium proof of it is still owed, most
 directly on Daniel's desktop Chrome (foreground tab, factory.8090.ai),
 which is also where the original failure was observed.
+
+## v2.7.0 — one-confirmation model (2026-10-28)
+
+Run: `run_e2e.py` against the staging tree at manifest 2.7.0, exit 0 — all 7 cases PASS (transcript: v270-run.log). The panel log shows exactly ONE card approved in the entire run: the full-control confirmation at pair time ("Give "Frame Rig" full control of this tab?" — approved once, before pairing completed). No prompt of any kind fired during any case afterward. First attempt at this run failed at pairing with approval_timeout because the rig started its prompt pump only after pairing — a rig ordering bug exposed by the new model (in v2.6.0 pairing needed no card); the pump now starts before the pair, and the product's fail-closed timeout behaved as designed throughout.
