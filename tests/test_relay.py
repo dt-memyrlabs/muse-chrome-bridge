@@ -152,7 +152,7 @@ async def main():
     tmp = tempfile.mkdtemp()
     state = os.path.join(tmp, "state.json")
     wsp, hp = free_port(), free_port()
-    relay = start_relay(wsp, hp, state, ["--device-wait", "1"])
+    relay = start_relay(wsp, hp, state, ["--device-wait", "1", "--pair-ack-timeout", "3"])
     WS, H = f"ws://127.0.0.1:{wsp}", f"http://127.0.0.1:{hp}"
     logs = RELAY_LOG
     try:
@@ -229,8 +229,8 @@ async def main():
         t0 = time.time()
         st, b = await ah("POST", H + "/pair", {"code": cs, "chatName": "Silent"})
         await dev.wait_for("paired")
-        check("a pairing the extension never confirms fails in about 10 s, with no session kept",
-              st == 400 and 8 < time.time() - t0 < 14 and "Silent" not in open(state).read(), (st, b, round(time.time() - t0, 1)))
+        check("a pairing the extension never confirms fails after the pair-ack window (3 s here; 100 s in production, for the v2.7 share confirmation), with no session kept",
+              st == 400 and 2 < time.time() - t0 < 8 and "Silent" not in open(state).read(), (st, b, round(time.time() - t0, 1)))
         dev.ack_pairs = "paired_ack"
 
         # second chat
