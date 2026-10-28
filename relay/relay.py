@@ -93,6 +93,12 @@ CODE_LEN = 8
 CODE_TTL = 300
 SESSION_TTL = 7 * 24 * 3600  # sessions expire after 7 days without a command
 CMD_TIMEOUT = 120  # seconds; --cmd-timeout overrides (tests)
+PAIR_ACK_TIMEOUT = 100    # seconds /pair waits for the extension's paired_ack;
+                          # since v2.7 the ack follows the user's ONE
+                          # full-control confirmation in the side panel
+                          # (the card itself allows 90 s), so this must
+                          # comfortably exceed a human's reading time;
+                          # --pair-ack-timeout overrides (tests)
 PAIR_FAILS_PER_MIN = 30
 MAX_DEVICES = 50
 MAX_CODES_PER_DEVICE = 10
@@ -245,6 +251,7 @@ class Relay:
         self.codes = {}         # code -> {"deviceId", "reqId", "expires"}
         self.pending = {}       # cmdId -> Future
         self.cmd_timeout = CMD_TIMEOUT
+        self.pair_ack_timeout = PAIR_ACK_TIMEOUT
         self.pair_fails = []    # [ts] of failed /pair attempts
         self.code_reqs = {}     # deviceId -> [ts] of pair_requests
         self.pair_acks = {}     # sessionId -> (threading.Event, [ok, error])
@@ -596,7 +603,7 @@ class Relay:
             self.sockets.pop(device_id, None)
             log(f"attach send failed for {device_id[:8]}: {type(e).__name__}")
             return None, "device_offline"
-        if not ack_ev.wait(timeout=10):
+        if not ack_ev.wait(timeout=self.pair_ack_timeout):
             with self.lock:
                 self.pair_acks.pop(session_id, None)
             log(f"attach ack timeout for device {device_id[:8]}")
@@ -661,8 +668,11 @@ class Relay:
         # The bytes left; now wait for the extension to confirm it actually
         # recorded the session (tab grouped, storage written). Without this,
         # a half-open socket silently eats the message and every later
-        # command fails with session_not_found.
-        if not ack_ev.wait(timeout=10):
+        # command fails with session_not_found. Since v2.7 the extension
+        # acks only after the user confirms full control for the tab in
+        # the side panel, so this wait is the pair-ack window (100 s),
+        # not a machine-speed timeout.
+        if not ack_ev.wait(timeout=self.pair_ack_timeout):
             with self.lock:
                 self.pair_acks.pop(session_id, None)
             with self.state.lock:
@@ -1036,6 +1046,7 @@ def main():
                     "(the native host creates the file and passes this in production)")
     ap.add_argument("--cmd-timeout", type=float, default=CMD_TIMEOUT, help="seconds a command may take (tests)")
     ap.add_argument("--device-wait", type=float, default=DEVICE_WAIT, help="seconds to wait for an offline device (tests)")
+    ap.add_argument("--pair-ack-timeout", type=float, default=PAIR_ACK_TIMEOUT, help="seconds /pair waits for the extension's paired_ack (tests)")
     ap.add_argument("--bind", default="auto", help="second chat-API listener: auto = this PC's Tailscale address, "
                     "off = loopback only, or a loopback / Tailscale (100.64.0.0/10) IPv4 address")
     ap.add_argument("--fixtures", action="store_true", help="serve the /fixture/ test pages (tests only; off by default)")
@@ -1065,6 +1076,7 @@ def main():
         log("device enrollment gate on (hello must prove the per-install secret)")
     relay.cmd_timeout = max(1.0, a.cmd_timeout)
     relay.device_wait = max(0.0, a.device_wait)
+    relay.pair_ack_timeout = max(1.0, a.pair_ack_timeout)
     relay.loop = asyncio.new_event_loop()
     ready = threading.Event()
     failed = []
