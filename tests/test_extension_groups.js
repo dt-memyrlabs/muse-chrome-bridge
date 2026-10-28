@@ -56,7 +56,8 @@ function helpers(F) {
     return { ok: false, error: "TEST_TIMEOUT" };
   }
   const groupOf = (tabId) => F.tabs.get(tabId).groupId;
-  const groupsTitled = (title) => [...F.groups.values()].filter((g) => g.title === title);
+  // v2.8: group titles may carry a state prefix (⌛/🔔/✅); identity is the bare title.
+  const groupsTitled = (title) => [...F.groups.values()].filter((g) => String(g.title || "").replace(/^(⌛|🔔|✅)\s?/, "") === title);
   return { owner, pair, cmd, groupOf, groupsTitled };
 }
 
