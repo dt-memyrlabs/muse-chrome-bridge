@@ -44,6 +44,14 @@ try {
     $reg | ForEach-Object { Say $_ }
     if ($LASTEXITCODE -ne 0) { throw "native host registration failed" }
 
+    # Stop a relay left running by a previous install before starting:
+    # start_relay() treats already-open ports as success and would leave
+    # the old relay code serving under the new install. Matches the
+    # relay process by its command line, as the deploy tooling does.
+    Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'relay\.py' } |
+        ForEach-Object { Say "Stopping previous relay (pid $($_.ProcessId))"; Stop-Process -Id $_.ProcessId -Force }
+    Start-Sleep -Seconds 1
+
     # Start the relay through the same code path the extension uses.
     $code = "import sys, json; sys.path.insert(0, r'$($dest)\native'); import relay_host; print(json.dumps(relay_host.start_relay()))"
     $answer = & $py -c $code 2>&1
