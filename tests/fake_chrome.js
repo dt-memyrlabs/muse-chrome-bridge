@@ -123,7 +123,8 @@ function install({ relayUrl, fakeSocket = true } = {}) {
       case "Page.captureScreenshot": return { data: typeof page.shot === "function" ? page.shot(params) : page.shot };
       case "DOM.getNodeForLocation": return { backendNodeId: 900 };
       case "DOM.resolveNode": return { object: { objectId: "obj:" + params.backendNodeId } };
-      case "DOM.describeNode": return { node: { attributes: [] } };
+      case "DOM.describeNode": return { node: typeof page.describeNode === "function" ? page.describeNode(params.backendNodeId) : { attributes: [] } };
+      case "DOM.getDocument": return { root: typeof page.domTree === "function" ? page.domTree(params) : (page.domTree || null) };
       case "DOM.getContentQuads": return { quads: typeof page.quads === "function" ? page.quads(target.tabId, params) : (page.quads || [[10, 10, 30, 10, 30, 30, 10, 30]]) };
       case "Accessibility.getFullAXTree":
         return { nodes: page.ax[target.tabId] || [{ nodeId: "1", role: { value: "RootWebArea" }, name: { value: "" }, backendDOMNodeId: 1 }] };
@@ -222,9 +223,34 @@ function install({ relayUrl, fakeSocket = true } = {}) {
       attach: async () => {}, detach: async () => {}, sendCommand, getTargets: async () => [],
       onDetach: { addListener: (f) => E.dbgDetach.addListener(f) },
     },
+    webNavigation: {
+      // The tab's frame inventory. Tests set page.frames (an array, or a
+      // map tabId -> array, or a function of the tab); by default the tab
+      // is a single top frame, which keeps the worker on its AX-only
+      // read path exactly as before.
+      getAllFrames: async ({ tabId }) => {
+        const t = tabs.get(Number(tabId));
+        if (!t) throw new Error("No tab with id: " + tabId);
+        if (typeof page.frames === "function") return page.frames(t);
+        if (page.frames && page.frames[t.id]) return page.frames[t.id];
+        return [{ frameId: 0, parentFrameId: -1, url: t.url, errorOccurred: false }];
+      },
+    },
     scripting: {
       executeScript: async ({ target, func, args }) => {
         if (!tabs.has(target.tabId)) throw new Error("No tab with id: " + target.tabId);
+        if (func && PROBE_SRC && String(func) === PROBE_SRC) {
+          // The worker is running the page probe inside one frame (the
+          // all-frames read). The test answers for the frame through
+          // page.frameProbe(tab, frameId, mode, args) -> the probe's v.
+          const t = tabs.get(target.tabId);
+          const frameId = target.frameIds && target.frameIds.length ? target.frameIds[0] : 0;
+          const frames = (typeof page.frames === "function" ? page.frames(t)
+            : (page.frames && page.frames[t.id])) || [{ frameId: 0, url: t.url }];
+          const fr = frames.find((f) => f.frameId === frameId) || frames[0];
+          const v = typeof page.frameProbe === "function" ? page.frameProbe(t, frameId, args[0], args[1]) : null;
+          return [{ result: { host: hostOf(fr && fr.url), v } }];
+        }
         if (func) {
           // The pill and the cursor are driven the same way; tell them apart
           // by the page-global each func drives, as the real page would.
