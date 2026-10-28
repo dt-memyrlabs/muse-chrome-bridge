@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Frame Rig Parent</title>
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  #control-zone { padding: 12px; }
+  #control-input { width: 420px; height: 56px; }
+  #chat-frame, #chat-frame-same { display: block; border: 0; outline: 2px solid #888; width: 780px; height: 470px; margin: 12px; }
+  #mirror, #mirror-same { white-space: pre-wrap; background: #f4f4f4; padding: 8px; margin: 12px; min-height: 60px; }
+</style>
+</head>
+<body>
+  <div id="control-zone">
+    <h1>Parent page (origin A)</h1>
+    <label for="control-input">Control message</label><br>
+    <textarea id="control-input"></textarea><br>
+    <button id="control-post">Post control</button>
+    <ul id="control-list"></ul>
+  </div>
+
+  <iframe id="chat-frame" src="__CHAT_ORIGIN__/chat.html" title="framed chat"></iframe>
+
+  <h2>Cross-origin framed chat state, as reported by the frame itself (postMessage)</h2>
+  <pre id="mirror">no frame state yet</pre>
+
+  <iframe id="chat-frame-same" src="/chat.html" title="same-origin framed chat"></iframe>
+
+  <h2>Same-origin framed chat state, as reported by the frame itself (postMessage)</h2>
+  <pre id="mirror-same">no frame state yet</pre>
+
+<script>
+  document.getElementById('control-post').addEventListener('click', () => {
+    const v = document.getElementById('control-input').value;
+    const li = document.createElement('li');
+    li.textContent = v;
+    document.getElementById('control-list').appendChild(li);
+  });
+
+  // The framed chat page reports its own state after every change. This is
+  // the parent shell's view of the frame (like a real app shell showing a
+  // status line); it is also what lets the bridge read the framed message
+  // list back through the parent tab.
+  window.addEventListener('message', (ev) => {
+    const d = ev.data;
+    if (!d || d.rig !== 'frame-state') return;
+    const lines = ['MESSAGES:'];
+    for (const m of d.messages) lines.push('MSG: ' + m);
+    lines.push('NOTE: ' + d.note);
+    lines.push('COMPOSER: ' + d.composer);
+    // The cross-origin frame reports from origin B; the same-origin frame
+    // reports from this page's own origin.
+    const el = d.origin && d.origin.includes(':8972') ? 'mirror' : 'mirror-same';
+    document.getElementById(el).textContent = lines.join('\n');
+  });
+</script>
+</body>
+</html>
