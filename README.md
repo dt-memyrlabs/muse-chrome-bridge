@@ -73,8 +73,7 @@ extension ID that Chrome shows in step 2.
    - Open `chrome://extensions`.
    - Turn on Developer mode.
    - Click "Load unpacked" and choose this tree's `extension` folder.
-   - Chrome now lists "Muse Chrome Bridge" and shows its extension
-     ID on that page. Keep the ID for the next step.
+   - Chrome now lists "Muse Chrome Bridge".
 
 3. Install the native-messaging host. The extension starts the relay
    through a native host named `com.memyr.muse_bridge`, and Chrome
@@ -82,15 +81,22 @@ extension ID that Chrome shows in step 2.
    From the folder that contains this README, run:
 
    ```
-   python native/install_native_host.py --extension-id <your-extension-id>
+   python native/install_native_host.py
    ```
 
-   Replace `<your-extension-id>` with the ID from step 2. The
-   installer writes the real native-host manifest for your user — its
-   `path` points at this tree's `native/relay_host.py` and its
-   `allowed_origins` names only your extension ID — into the per-user
-   native-messaging location for your operating system (Windows and
-   macOS are supported). The tree ships only a template,
+   No extension ID is needed: Chrome gives an unpacked extension an
+   ID made from its folder path, and the installer works it out from
+   this tree's `extension` folder. (If you ever load the extension
+   from a different folder, pass `--extension-id <id>` with the ID
+   shown on chrome://extensions.) The installer writes the real
+   native-host manifest for your user — on Windows its `path` points
+   at a small `relay_host.bat` launcher the installer generates next
+   to `relay_host.py`, because Chrome starts the host by executing
+   that path and cannot execute a `.py` file; elsewhere it points at
+   `relay_host.py` itself — and its `allowed_origins` names only your
+   extension ID. It writes into the per-user native-messaging
+   location for your operating system (Windows and macOS are
+   supported). The tree ships only a template,
    `native/com.memyr.muse_bridge.json.template`, whose `path` and
    extension ID are placeholders. Do not edit or use that template by
    hand; the installer generates the manifest your machine needs.
