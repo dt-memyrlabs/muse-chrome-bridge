@@ -28,18 +28,21 @@ function install({ relayUrl, fakeSocket = true } = {}) {
   const groups = new Map();
   let nextTab = 100, nextGroup = 1, ctxSeq = 0;
   const localStore = { enrollSecret: TEST_SECRET, ...(relayUrl ? { relayUrl } : {}) };
+  const managedStore = {}; // chrome.storage.managed (org policy, e.g. blockedUrlPatterns)
   const sessionStore = {};
   const sent = [];      // messages the worker sent over the fake socket
   const cdpLog = [];    // every CDP call: {tabId, method, params}
   const inputs = [];    // Input.* calls only
   const notifications = new Set();
   const windowTypes = {}; // windowId -> "normal" | "app" | "popup"
+  const windowStates = {}; // windowId -> "normal" | "minimized" | "maximized" | "fullscreen"
   let lastFocusedWindowId = 1;
   const E = {
     tabsUpdated: event(), tabsRemoved: event(), groupsRemoved: event(), groupsUpdated: event(),
     runtimeMsg: event(), tabsAttached: event(), tabsDetached: event(),
     alarm: event(), installed: event(), startup: event(), notifClicked: event(), dbgDetach: event(),
     tabsCreated: event(), tabsActivated: event(), winFocus: event(), dbgEvent: event(),
+    storageChanged: event(),
   };
   // Test knob for chrome.tabs.group failures beyond the window-type
   // refusal below: a function ({tabIds, groupId, createProperties}) that
@@ -49,6 +52,10 @@ function install({ relayUrl, fakeSocket = true } = {}) {
   // ({tabId, method, params}) that returns an Error to throw from
   // chrome.debugger.sendCommand, or null to let the call proceed.
   const cdpBox = { hook: null };
+  const evalBox = { result: null }; // canned Runtime.evaluate reply for the javascript_tool tests
+  const alarms = {}; // alarm name -> last create info (saved-prompt schedules)
+  const gifBox = { reply: null, lastMsg: null }; // canned offscreen GENERATE_GIF answer
+  const windowSizes = {}; // windowId -> last chrome.windows.update props
   const dbgAttach = { count: 0 }; // chrome.debugger.attach calls seen
   // Ordered record of the visual layer, for hide-for-capture sequence
   // assertions: {kind:"cursor"|"pill", tabId, arg} for every scripting
@@ -58,6 +65,8 @@ function install({ relayUrl, fakeSocket = true } = {}) {
   const visualLog = [];
   let nextOwnWindow = 5000; // windows created around an existing tab
   const pillOf = {};   // tabId -> chat name the pill shows (set through chrome.scripting)
+  const agentUIOf = {}; // tabId -> last agent-ui command (working/static layer)
+  const agentUILog = []; // every agent-ui command, in order
   const cursorOf = {}; // tabId -> last cursor command the worker sent (through chrome.scripting)
   const captures = []; // every captureVisibleTab call: {windowId, at}
   // What the page looks like to the probe. Tests change these.
@@ -79,7 +88,8 @@ function install({ relayUrl, fakeSocket = true } = {}) {
   });
   function mkTab(url, extra) {
     const t = { id: nextTab++, url, pendingUrl: undefined, title: url, groupId: -1, windowId: 1,
-                active: false, openerTabId: undefined, status: "complete", ...extra };
+                active: false, openerTabId: undefined, status: "complete",
+                audible: false, mutedInfo: { muted: false }, ...extra };
     tabs.set(t.id, t);
     E.tabsCreated.fire({ ...t });
     return t;
@@ -167,7 +177,9 @@ function install({ relayUrl, fakeSocket = true } = {}) {
         const fn = new Function("return (" + src + ")")();
         return { result: { value: fn.apply(el, args) } };
       }
-      case "Input.dispatchMouseEvent": case "Input.dispatchKeyEvent": case "Input.insertText":
+      case "Runtime.evaluate":
+        return evalBox.result || { result: { type: "undefined" } };
+      case "Input.dispatchMouseEvent": case "Input.dispatchKeyEvent": case "Input.insertText": case "Input.dispatchDragEvent":
         // page.hangWheel: Chrome never answers a wheel event (seen on WhatsApp 2026-09-28)
         if (method === "Input.dispatchMouseEvent" && params.type === "mouseWheel" && page.hangWheel) return new Promise(() => {});
         inputs.push({ tabId: target.tabId, method, params });
@@ -180,11 +192,19 @@ function install({ relayUrl, fakeSocket = true } = {}) {
     runtime: {
       id: "extid", getURL: (p) => "chrome-extension://extid/" + p,
       sendNativeMessage: async () => ({ ok: true, started: false, running: true, enrollSecret: TEST_SECRET }),
-      sendMessage: async () => {}, onMessage: { addListener: (f) => E.runtimeMsg.addListener(f) },
+      sendMessage: async (msg) => {
+        if (msg && msg.kind === "GENERATE_GIF") {
+          gifBox.lastMsg = msg;
+          return gifBox.reply || { ok: true, gif: "data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAACAkQBADs=",
+            frames: (msg.frames || []).length, width: 800, height: 600 };
+        }
+        return {};
+      }, onMessage: { addListener: (f) => E.runtimeMsg.addListener(f) },
       onInstalled: { addListener: (f) => E.installed.addListener(f) },
       onStartup: { addListener: (f) => E.startup.addListener(f) },
     },
-    storage: { local: store(localStore), session: store(sessionStore) },
+    storage: { local: store(localStore), session: store(sessionStore), managed: store(managedStore),
+               onChanged: { addListener: (f) => E.storageChanged.addListener(f), removeListener: () => {} } },
     tabs: {
       get: async (id) => { const t = tabs.get(Number(id)); if (!t) throw new Error("No tab"); return { ...t }; },
       query: async (q) => [...tabs.values()].filter((t) =>
@@ -192,7 +212,14 @@ function install({ relayUrl, fakeSocket = true } = {}) {
         (q.windowId === undefined || t.windowId === q.windowId) &&
         (q.lastFocusedWindow === undefined || !q.lastFocusedWindow || t.windowId === lastFocusedWindowId)).map((t) => ({ ...t })),
       create: async ({ url, windowId, active }) => ({ ...mkTab(url || "about:blank", { windowId, active: !!active }) }),
-      update: async (id, { url }) => { setUrl(id, url); return { ...tabs.get(id) }; },
+      update: async (id, props = {}) => {
+        const t = tabs.get(Number(id));
+        if (!t) throw new Error("No tab with id: " + id);
+        if (props.url !== undefined) setUrl(id, props.url);
+        if (props.muted !== undefined) t.mutedInfo = { ...(t.mutedInfo || {}), muted: !!props.muted };
+        if (props.active !== undefined) t.active = !!props.active;
+        return { ...tabs.get(Number(id)) };
+      },
       group: async ({ tabIds, groupId, createProperties }) => {
         if (groupBox.hook) { const err = groupBox.hook({ tabIds, groupId, createProperties }); if (err) throw err; }
         for (const id of tabIds) {
@@ -282,6 +309,7 @@ function install({ relayUrl, fakeSocket = true } = {}) {
           // The pill and the cursor are driven the same way; tell them apart
           // by the page-global each func drives, as the real page would.
           if (String(func).includes("__museBridgeCursor")) { cursorOf[target.tabId] = args && args[0]; visualLog.push({ kind: "cursor", tabId: target.tabId, arg: args && args[0] }); }
+          else if (String(func).includes("__museBridgeAgentUI")) { agentUIOf[target.tabId] = args && args[0]; agentUILog.push({ tabId: target.tabId, arg: args && args[0] }); visualLog.push({ kind: "agentui", tabId: target.tabId, arg: args && args[0] }); }
           else { pillOf[target.tabId] = args && args[0]; visualLog.push({ kind: "pill", tabId: target.tabId, arg: args && args[0] }); }
         }
         return [{ result: null }];
@@ -294,11 +322,15 @@ function install({ relayUrl, fakeSocket = true } = {}) {
       onClicked: { addListener: (f) => E.notifClicked.addListener(f) },
     },
     sidePanel: { setPanelBehavior: async () => {}, open: async () => {} },
-    alarms: { create: () => {}, onAlarm: { addListener: (f) => E.alarm.addListener(f) } },
+    alarms: { create: (name, info) => { alarms[name] = { ...(info || {}) }; },
+              clear: async (name) => { const had = name in alarms; delete alarms[name]; return had; },
+              onAlarm: { addListener: (f) => E.alarm.addListener(f) } },
     windows: {
       getLastFocused: async () => ({ id: lastFocusedWindowId }),
       getCurrent: async () => ({ id: lastFocusedWindowId }),
-      get: async (id) => ({ id, type: windowTypes[id] || "normal", incognito: false }),
+      update: async (id, props = {}) => { windowSizes[id] = { ...(windowSizes[id] || {}), ...props }; return { id, ...props }; },
+      get: async (id) => ({ id, type: windowTypes[id] || "normal", incognito: false,
+                            focused: id === lastFocusedWindowId, state: (windowStates[id] || "normal") }),
       getAll: async () => [...new Set([1, ...[...tabs.values()].map((t) => t.windowId)])]
         .filter((id) => (windowTypes[id] || "normal") === "normal").map((id) => ({ id, type: "normal", incognito: false })),
       create: async ({ url, tabId, type }) => {
@@ -341,9 +373,9 @@ function install({ relayUrl, fakeSocket = true } = {}) {
   const panel = (kind, extra, sender = PANEL) => new Promise((resolve) => {
     E.runtimeMsg.fire({ kind, ...(extra || {}) }, sender, resolve);
   });
-  return { tabs, groups, sent, cdpLog, inputs, notifications, windowTypes, pillOf, cursorOf, captures, E, page, mkTab, setGroup, setUrl, mkGroup, moveToWindow, FakeWS, groupBox, cdpBox, dbgAttach, visualLog,
+  return { tabs, groups, sent, cdpLog, inputs, notifications, windowTypes, windowStates, windowSizes, evalBox, alarms, gifBox, pillOf, cursorOf, agentUIOf, agentUILog, captures, E, page, mkTab, setGroup, setUrl, mkGroup, moveToWindow, FakeWS, groupBox, cdpBox, dbgAttach, visualLog,
            setLastFocusedWindow: (id) => { lastFocusedWindowId = id; },
-           panel, sessionStore, localStore, sw: (expr) => vm.runInThisContext(expr) };
+           panel, sessionStore, localStore, managedStore, sw: (expr) => vm.runInThisContext(expr) };
 }
 
 module.exports = { install, hostOf };
