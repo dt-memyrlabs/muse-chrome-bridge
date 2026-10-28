@@ -1,0 +1,113 @@
+ports busy ([19822, 20822, 9229]); waiting for them to free up...
+ports busy ([19822, 20822, 9229]); waiting for them to free up...
+ports busy ([19822, 20822, 9229]); waiting for them to free up...
+ports busy ([19822, 20822, 9229]); waiting for them to free up...
+ports busy ([19822, 20822, 9229]); waiting for them to free up...
+ports busy ([19822, 20822, 9229]); waiting for them to free up...
+ports busy ([19822, 20822, 9229]); waiting for them to free up...
+ports busy ([19822, 20822, 9229]); waiting for them to free up...
+rig tmp dir: /tmp/frame-rig-78i07asa
+extension under test: /home/hatch/workspace/muse-browser-bridge/attach-on-redeem/extension
+origins up: A=http://frame-a.test:8971 B=http://frame-b.test:8972
+relay up (enroll-secret gated)
+chromium up
+/home/hatch/workspace/muse-browser-bridge/frame-copy/e2e/run_e2e.py:118: DeprecationWarning: connect() must be used as a context manager: with connect(...) as websocket: ...; alternatively, use websocket = connect(..., legacy=True) to connect directly
+  self.ws.send(json.dumps(msg))
+extension loaded: id=kakpicabljpbdbhjokkldmlkdbgcehoj url=chrome-extension://kakpicabljpbdbhjokkldmlkdbgcehoj/sw.js
+parent page loaded
+enroll secret provisioned into extension storage: set
+parent chrome tab id=1918915171 window id=1918915169
+extension connected to relay: {'connected': True, 'url': 'ws://127.0.0.1:19822', 'error': '', 'startError': '11:06:50 AM Specified native messaging host not found.'}
+panel prompt pump running (auto-approves panel cards, logging each)
+share requested: {'ok': True, 'reqId': '0cde3583-96ff-4a71-97ea-e59e73d4ade0'}
+pairing code obtained: YU5PHT92
+  [panel] APPROVED prompt: 'Give "Frame Rig" full control of this tab?' -- 'On frame-a.test:8971, "Frame Rig" will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.' -> {'ok': True}
+  client pair YU5PHT92 --chat Frame Rig -> exit 0: {"ok": true, "chat": "Frame Rig", "sessionId": "128b77f170f4da0487caacad", "tokenFile": "/tmp/frame-rig-78i07asa/chat/.muse-bridge-token"}
+chat paired as None session 128b77f170f4da0487caacad
+  client tabs_context {} -> exit 0: {"ok": true, "data": {"chat": "Frame Rig", "tabs": [{"tabId": 1918915171, "title": "Frame Rig Parent", "url": "http://frame-a.test:8971/parent.html", "active": true}], "permittedSites": ["frame-a.test:8971"]}, "pageContent": "untrusted"}
+harness reads the framed page via: oopif target
+iframe rect in parent viewport: {'x': 12, 'y': 236.875, 'w': 780, 'h': 470}
+
+CASE framed-contenteditable: click composer, type, click Send, read list back
+  composer viewport point: [402, 508]
+  client computer {"action": "left_click", "tabId": 1918915171, "coordinate": [402, 508]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 1918915171, "text": "alpha-composer-123"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  frame truth after typing: {'messages': [], 'note': '', 'composer': 'alpha-composer-123'}
+  send button viewport point: [58, 644]
+  client computer {"action": "left_click", "tabId": 1918915171, "coordinate": [58, 644]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1918915171} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG: alpha-composer-123\n
+  frame messages: ['alpha-composer-123']
+  in framed message list (ground truth): True; in bridge read-back of parent tab: True
+  => PASS framed-contenteditable
+
+CASE framed-textarea: click textarea, type, read value back
+  textarea viewport point: [235, 592]
+  client computer {"action": "left_click", "tabId": 1918915171, "coordinate": [235, 592]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 1918915171, "text": "bravo-textarea-456"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1918915171} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG: alpha-composer-123\n
+  frame textarea value (ground truth): 'bravo-textarea-456'
+  value exact match: True; in bridge read-back: True
+  => PASS framed-textarea
+
+CASE parent-control: click control textarea, type, click Post, read list back
+  control textarea viewport point: [225, 141]
+  client computer {"action": "left_click", "tabId": 1918915171, "coordinate": [225, 141]} -> exit 0: {"ok": true, "data": {"clicked": "textbox \"Control message\""}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 1918915171, "text": "charlie-control-789"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  client computer {"action": "left_click", "tabId": 1918915171, "coordinate": [55, 186]} -> exit 0: {"ok": true, "data": {"clicked": "button \"Post control\""}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1918915171} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\ncharlie-control-789\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG:
+  parent control list (ground truth): ['charlie-control-789']
+  in control list: True; in bridge read-back: True
+  => PASS parent-control
+
+CASE ref-cross-composer: find the cross-origin framed composer by label, click its ref, type, click the Send ref
+  client find {"tabId": 1918915171, "query": "message composer"} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "matches": [{"ref": "ref_24", "role": "textbox", "name": "Message composer", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_12", "role": "StaticText", "name": "MESSAGES:\nMSG: alpha-composer-123\nNOTE: bravo-textarea-456\nCOMPOSER: "}, {"ref":
+  client find {"tabId": 1918915171, "query": "note textarea"} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "matches": [{"ref": "ref_12", "role": "StaticText", "name": "MESSAGES:\nMSG: alpha-composer-123\nNOTE: bravo-textarea-456\nCOMPOSER: "}, {"ref": "ref_25", "role": "textbox", "name": "Note", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_30", "
+  client find {"tabId": 1918915171, "query": "Send button"} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "matches": [{"ref": "ref_26", "role": "button", "name": "Send", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_31", "role": "button", "name": "Send", "frame": "http://frame-a.test:8971/chat.html"}, {"ref": "ref_10", "role": "button", "name": "
+  cross-origin refs: composer=ref_24 note=ref_25 send=ref_26
+  client computer {"action": "left_click", "tabId": 1918915171, "ref": "ref_24"} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 1918915171, "text": "golf-refcross-333"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  frame truth after ref-click + type: {'messages': ['alpha-composer-123'], 'note': 'bravo-textarea-456', 'composer': 'golf-refcross-333'}
+  client computer {"action": "left_click", "tabId": 1918915171, "ref": "ref_26"} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1918915171} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\ncharlie-control-789\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG:
+  frame messages: ['alpha-composer-123', 'golf-refcross-333']
+  in framed message list (ground truth): True; in bridge read-back of parent tab: True
+  => PASS ref-cross-composer
+
+CASE ref-framed-textarea: form_input sets the cross-origin framed textarea by ref
+  client form_input {"tabId": 1918915171, "ref": "ref_25", "value": "echo-forminput-111"} -> exit 0: {"ok": true, "data": {"set": "textbox \"Note\" (in a frame from frame-b.test:8972)"}, "pageContent": "untrusted"}
+  frame textarea value (ground truth): 'echo-forminput-111' (wanted 'echo-forminput-111')
+  => PASS ref-framed-textarea
+
+CASE ref-sameorigin-composer: the same ref flow inside the same-origin frame
+  client find {"tabId": 1918915171, "query": "message composer"} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "matches": [{"ref": "ref_35", "role": "textbox", "name": "Message composer", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_32", "role": "StaticText", "name": "MESSAGES:\nMSG: alpha-composer-123\nMSG: golf-refcross-333\nNOTE: echo-forminput-11
+  client find {"tabId": 1918915171, "query": "Send button"} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "matches": [{"ref": "ref_37", "role": "button", "name": "Send", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_31", "role": "button", "name": "Send", "frame": "http://frame-a.test:8971/chat.html"}, {"ref": "ref_10", "role": "button", "name": "
+  same-origin refs: composer=ref_29 send=ref_31
+  client computer {"action": "left_click", "tabId": 1918915171, "ref": "ref_29"} -> exit 0: {"ok": true, "data": {"clicked": "div \"Message composer\" (in a frame from frame-a.test:8971)"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 1918915171, "text": "delta-sameorigin-000"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  same-origin frame truth after ref-click + type: {'messages': [], 'note': '', 'composer': 'delta-sameorigin-000'}
+  client computer {"action": "left_click", "tabId": 1918915171, "ref": "ref_31"} -> exit 0: {"ok": true, "data": {"clicked": "button \"Send\" (in a frame from frame-a.test:8971)"}, "pageContent": "untrusted"}
+  same-origin frame messages: ['delta-sameorigin-000']
+  => PASS ref-sameorigin-composer
+
+CASE background-framed-composer: decoy tab in front, drive the shared (background) tab
+  decoy tab activated; the shared tab is now in the background
+  iframe rect re-measured for the background case: {'x': 12, 'y': 270.875, 'w': 780, 'h': 470}
+  client computer {"action": "left_click", "tabId": 1918915171, "coordinate": [402, 542]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 1918915171, "text": "foxtrot-background-222"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  frame truth after typing: {'messages': ['alpha-composer-123', 'golf-refcross-333'], 'note': 'echo-forminput-111', 'composer': 'foxtrot-background-222'}
+  client computer {"action": "left_click", "tabId": 1918915171, "coordinate": [58, 678]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 1918915171} -> exit 0: {"ok": true, "data": {"tabId": 1918915171, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\ncharlie-control-789\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG:
+  frame messages: ['alpha-composer-123', 'golf-refcross-333', 'foxtrot-background-222']
+  in framed message list (ground truth): True; in bridge read-back of parent tab: True
+  => PASS background-framed-composer
+panel prompts approved during the run: 1
+  approved: 'Give "Frame Rig" full control of this tab?' -- 'On frame-a.test:8971, "Frame Rig" will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.'
+
+==== SUMMARY ====
+PASS framed-contenteditable
+PASS framed-textarea
+PASS parent-control
+PASS ref-cross-composer
+PASS ref-framed-textarea
+PASS ref-sameorigin-composer
+PASS background-framed-composer
