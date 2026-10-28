@@ -20,7 +20,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.7.0";
+const VERSION = "2.7.1";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -322,9 +322,14 @@ async function reconcile(msg) {
 // window, and group membership IS the control set: a tab a chat owns is
 // moved into its group, a tab Daniel moves into the group is adopted by
 // that chat, and a tab moved out of the group is released (see
-// DESIGN-GROUPS.md). Chrome refuses groups in some windows (app windows):
-// grouping is attempted after ownership is settled and a failure only
-// leaves the tab ungrouped — the tab stays the chat's, with its pill.
+// DESIGN-GROUPS.md). Grouping follows Claude in Chrome's manager: the
+// worker tracks each chat's groups itself and reconciles against live
+// state; a window that refuses groups (Chrome's "grouping is not
+// supported", or a non-normal window) is not retried in place — the
+// tab moves to a window where the group can form; and a failure that
+// leaves a tab ungrouped is recorded durably (event record + panel
+// state with the real error), never silent. The tab stays the chat's,
+// with its pill, grouped or not.
 // The pill (pill.js) shows which tabs are shared.
 const tabIdsOf = (s) => Object.keys((s && s.tabs) || {}).map(Number);
 // In-memory mirror of tab ownership, updated synchronously at the moment
@@ -401,7 +406,7 @@ async function attachTab(sessionId, tab) {
   // A transfer ends the previous chat's claim on this tab at once: its
   // pending prompts for the tab are canceled and its in-flight commands
   // on the tab are marked canceled, so a late result is dropped.
-  if (prevOwner) { cancelTabWork(tab.id, sessionId); await clearGroupRetry(prevOwner, tab.id); await cancelIfNoTabs(prevOwner); await dropIfEmpty(prevOwner, "last tab taken by another chat"); }
+  if (prevOwner) { cancelTabWork(tab.id, sessionId); await clearGroupRetry(prevOwner, tab.id); await clearGroupMoved(prevOwner, tab.id); await cancelIfNoTabs(prevOwner); await dropIfEmpty(prevOwner, "last tab taken by another chat"); }
   if (chat) { await groupTab(sessionId, tab); pill(tab.id, chat); }
   else memRemove(tab.id); // no such session: undo the mirror move above
   return chat;
@@ -428,7 +433,7 @@ async function releaseTab(tabId) {
   forgetTabView(tabId);
   await ungroupTab(tabId, chat);
   await detach(tabId);
-  if (ownerSid) { await clearGroupRetry(ownerSid, tabId); await dropIfEmpty(ownerSid, "last tab removed"); }
+  if (ownerSid) { await clearGroupRetry(ownerSid, tabId); await clearGroupMoved(ownerSid, tabId); await dropIfEmpty(ownerSid, "last tab removed"); }
   return chat;
 }
 /* ------------------------------------------------------- tab groups */
@@ -444,25 +449,60 @@ function groupColor(chatName) {
   return COLORS[h % COLORS.length];
 }
 async function rememberGroup(sessionId, windowId, groupId) {
+  let rotated = null;
   await withState((st) => {
     const s = st[sessionId];
     if (!s) return;
     s.groups = s.groups || {};
-    if (Number(s.groups[String(windowId)]) !== groupId) s.groups[String(windowId)] = groupId;
+    const prev = Number(s.groups[String(windowId)]);
+    // Group-id rotation is followed, never fought (Claude's
+    // followRotatedGroupId): if the cache held a different id for this
+    // window, the live one wins and the change leaves a trace.
+    if (Number.isInteger(prev) && prev >= 0 && prev !== groupId) rotated = { chat: s.chatName, prev };
+    if (prev !== groupId) s.groups[String(windowId)] = groupId;
   });
+  if (rotated) await audit(rotated.chat, "tab group", "the group id for this window changed (" + rotated.prev + " → " + groupId + "); following the new id", "ok").catch(() => {});
+}
+// Grouping attempts are bounded by one mark per tab, shared by the
+// membership sync and the lifecycle retries below.
+const GROUP_RETRY_MAX = 8;
+// The durable record of a grouping failure, per chat: the last error
+// Chrome gave, the type of window it happened in, and when. The panel
+// state carries it, so a missing group is visible for as long as it is
+// missing — an audit line alone scrolls away under a busy chat and the
+// failure went invisible (Daniel, 2026-10-28). Cleared the moment any
+// tab of the chat is confirmed in the chat's group again.
+async function noteGroupFailure(sessionId, text, windowType) {
+  await withState((st) => { const v = st[sessionId]; if (!v) return; v.groupError = { text: String(text || ""), windowType: windowType || "", at: Date.now() }; }).catch(() => {});
+}
+// The error clears only when no tab of the chat still carries a retry
+// mark — one tab healing must not hide a sibling's failure.
+async function clearGroupError(sessionId) {
+  await withState((st) => { const v = st[sessionId]; if (!v || !v.groupError) return; if (Object.keys(v.groupRetry || {}).length === 0) delete v.groupError; }).catch(() => {});
+}
+// A tab that was moved into a window of its own so its group could form
+// is not moved again for the same chat: one move per tab per session.
+async function markGroupMoved(sessionId, tabId) {
+  await withState((st) => { const v = st[sessionId]; if (!v) return; v.groupMoved = v.groupMoved || {}; v.groupMoved[String(tabId)] = true; }).catch(() => {});
+}
+async function clearGroupMoved(sessionId, tabId) {
+  await withState((st) => { const v = st[sessionId]; if (v && v.groupMoved) delete v.groupMoved[String(tabId)]; }).catch(() => {});
 }
 // Move a tab the session already owns into the session's group in the
 // tab's window: reuse the verified cached group, else a group in that
 // window already carrying the session's title, else a new group (titled
-// and coloured here). Never throws: a window that refuses groups leaves
-// the tab owned and ungrouped, with an audit line.
+// and coloured here). Never throws. A window that refuses groups sends
+// the tab to a window where the group can form (groupTabViaOwnWindow);
+// any failure that still leaves the tab ungrouped is recorded durably —
+// mark, session groupError, audit line with Chrome's real error text.
 // Tabs whose grouping Chrome refused when they were shared (the tab was
 // mid-drag, or its window declines tab groups). Such a tab never landed
 // in its group, so being groupless is not "leaving": the membership sync
 // must not release it (the release branch would drop a live shared tab
-// on the first stray group event). Instead the sync retries grouping;
-// the mark counts the tries and bounds them. After the bound the tab
-// simply stays shared and ungrouped — pill and panel still carry it.
+// on the first stray group event). Instead the sync and the lifecycle
+// retries retry grouping; the mark counts the tries and bounds them.
+// After the bound the tab simply stays shared and ungrouped — pill and
+// panel still carry it, and the panel says the group is missing and why.
 async function markGroupRetry(sessionId, tabId) {
   await withState((st) => { const v = st[sessionId]; if (!v) return; v.groupRetry = v.groupRetry || {}; const k = String(tabId); v.groupRetry[k] = (Number(v.groupRetry[k]) || 0) + 1; }).catch(() => {});
 }
@@ -489,19 +529,96 @@ async function groupTab(sessionId, tab) {
       const hit = (inWindow || []).find((g) => g.title === title);
       if (hit) gid = hit.id;
     }
-    if (gid != null && tab.groupId === gid) { await rememberGroup(sessionId, tab.windowId, gid); await clearGroupRetry(sessionId, tab.id); return; }
+    if (gid != null && tab.groupId === gid) { await rememberGroup(sessionId, tab.windowId, gid); await clearGroupRetry(sessionId, tab.id); await clearGroupError(sessionId); return; }
     if (gid != null) await chrome.tabs.group({ groupId: gid, tabIds: [tab.id] });
     else {
-      gid = await chrome.tabs.group({ tabIds: [tab.id] });
+      // Claude's groupTabInOwnWindow shape: name the tab's own window
+      // explicitly when the group is created.
+      gid = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } });
       await chrome.tabGroups.update(gid, { title, color: groupColor(s.chatName) });
     }
     await rememberGroup(sessionId, tab.windowId, gid);
     await clearGroupRetry(sessionId, tab.id);
+    await clearGroupError(sessionId);
   } catch (e) {
-    await markGroupRetry(sessionId, tab.id);
+    const msg = String((e && e.message) || e);
     let wtype = "";
-    try { const w = await chrome.windows.get(tab.windowId); if (w && w.type) wtype = " (window type: " + w.type + ")"; } catch (err) {}
-    await audit(chat, "tab group", P.clip(((e && e.message) || e) + wtype, 120), "grouping failed; the tab stays shared and ungrouped, and the bridge keeps retrying").catch(() => {});
+    try { const w = await chrome.windows.get(tab.windowId); if (w && w.type) wtype = String(w.type); } catch (err) {}
+    // Failure classification decides the response, as in Claude's
+    // manager: a TRANSIENT refusal (the tab is being dragged, Chrome is
+    // mid-edit) is recorded and retried later — nothing is moved. A
+    // REFUSING window (not a normal window, or Chrome's "grouping is
+    // not supported" for this window) is not sat in and retried: the
+    // tab moves somewhere grouping works. Any other error is recorded
+    // with its real text and retried by the lifecycle hooks.
+    const transient = /drag|cannot be edited right now|may be editing/i.test(msg);
+    const refusing = !transient && ((wtype !== "" && wtype !== "normal") || /not supported/i.test(msg));
+    if (refusing && await groupTabViaOwnWindow(sessionId, tab, msg)) return;
+    await markGroupRetry(sessionId, tab.id);
+    await noteGroupFailure(sessionId, msg, wtype);
+    await audit(chat, "tab group", P.clip(msg + (wtype ? " (window type: " + wtype + ")" : ""), 200),
+      "grouping failed; the tab stays shared and ungrouped").catch(() => {});
+  }
+}
+// Tabs with a window move in flight: the move's own detach/attach events
+// must not be read by the membership sync as "groupless = left" while
+// the tab is between windows.
+const ownWindowMoves = new Set();
+// The escape from a window that refuses groups (Claude's model: never
+// sit retrying in a window that refuses). The tab joins the session's
+// group in another window if one exists — grouping a tab into a group
+// elsewhere moves the tab there — and otherwise gets a window of its
+// own and starts the group there. Every move is written to the event
+// record with the refusal that caused it: visible, never silent.
+// Returns true when the tab ended up grouped.
+async function groupTabViaOwnWindow(sessionId, tab, causeMsg) {
+  if (ownWindowMoves.has(tab.id)) return false;
+  const s0 = (await getSessions())[sessionId];
+  if (!s0) return false;
+  if (s0.groupMoved && s0.groupMoved[String(tab.id)]) return false; // one move per tab per session
+  ownWindowMoves.add(tab.id);
+  try {
+    const title = groupTitle(s0);
+    const host = P.hostOf(tab.url);
+    let gid = null;
+    for (const [w, id] of Object.entries(s0.groups || {})) {
+      if (Number(w) === tab.windowId) continue;
+      const g = await chrome.tabGroups.get(Number(id)).catch(() => null);
+      if (g && g.title === title) { gid = g.id; break; }
+    }
+    if (gid == null) {
+      const all = await chrome.tabGroups.query({ title }).catch(() => []);
+      const hit = (all || []).find((g) => g.windowId !== tab.windowId);
+      if (hit) gid = hit.id;
+    }
+    if (gid != null) {
+      await chrome.tabs.group({ groupId: gid, tabIds: [tab.id] });
+      const now = await chrome.tabs.get(tab.id).catch(() => null);
+      if (now) await rememberGroup(sessionId, now.windowId, gid);
+      await clearGroupRetry(sessionId, tab.id);
+      await clearGroupError(sessionId);
+      await markGroupMoved(sessionId, tab.id);
+      await audit(s0.chatName, "tab moved", host,
+        "moved into this chat's group in another window — this tab's window refused grouping (" + P.clip(causeMsg, 100) + ")").catch(() => {});
+      notifyPanel();
+      return true;
+    }
+    const win = await chrome.windows.create({ tabId: tab.id, type: "normal", focused: false });
+    if (!win || win.id == null) return false;
+    gid = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: win.id } });
+    await chrome.tabGroups.update(gid, { title, color: groupColor(s0.chatName), collapsed: false });
+    await rememberGroup(sessionId, win.id, gid);
+    await clearGroupRetry(sessionId, tab.id);
+    await clearGroupError(sessionId);
+    await markGroupMoved(sessionId, tab.id);
+    await audit(s0.chatName, "tab moved", host,
+      "moved to its own window so Chrome can hold this chat's tab group — the old window refused grouping (" + P.clip(causeMsg, 100) + ")").catch(() => {});
+    notifyPanel();
+    return true;
+  } catch (e) {
+    return false;
+  } finally {
+    ownWindowMoves.delete(tab.id);
   }
 }
 // Take a tab out of its session's group (release paths). Only a group
@@ -526,6 +643,9 @@ async function ungroupTab(tabId, chatName) {
 function syncTabGroupMembership(tabId) {
   return serial("groupSync", async () => {
     tabId = Number(tabId);
+    // A tab between windows (its own-window move is in flight) reads as
+    // groupless for a moment; that is not leaving, and not adoptable.
+    if (ownWindowMoves.has(tabId)) return;
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) return;
     const sessions = await getSessions();
@@ -581,7 +701,7 @@ function syncTabGroupMembership(tabId) {
         // it for that; retry grouping instead (bounded by the mark),
         // so the tab heals itself once Chrome accepts the group (for
         // example after the tab is moved to a window that allows them).
-        if (retryMark <= 8) await groupTab(ownerSid, tab);
+        if (retryMark <= GROUP_RETRY_MAX) await groupTab(ownerSid, tab);
       } else {
         // The tab left its chat's group (ungrouped, moved to another
         // group, or moved to another window): the session loses it now.
@@ -590,6 +710,10 @@ function syncTabGroupMembership(tabId) {
       }
     } else if (groupSid && groupSid === ownerSid) {
       await rememberGroup(groupSid, tab.windowId, tab.groupId);
+      // Confirmed in its group (possibly put there by Daniel's own
+      // drag): any recorded grouping failure for this chat is stale.
+      await clearGroupRetry(groupSid, tabId);
+      await clearGroupError(groupSid);
     }
   }).catch(() => {});
 }
@@ -602,6 +726,55 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
     setTimeout(() => syncTabGroupMembership(tabId), 1200);
     setTimeout(() => syncTabGroupMembership(tabId), 4000);
   }
+  if (info && info.status === "complete") retryGrouping(tabId).catch(() => {});
+});
+// Lifecycle reconciliation (Claude's manager reconciles its tracking
+// against live Chrome state on change — not only on group-shaped
+// events). Before v2.7.1 the ONLY retry driver was the membership sync,
+// which fires on group events a never-grouped tab never produces: a tab
+// that failed grouping at share time and then just sat there was never
+// retried, and nothing anywhere said so. A failed tab now gets another
+// try at the moments its window may have settled — activation, load
+// complete (above), window focus — bounded by the same mark.
+async function retryGrouping(tabId) {
+  tabId = Number(tabId);
+  if (ownWindowMoves.has(tabId)) return;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return;
+  const sid = memOwner.get(tabId) || (await ownerOf(tabId));
+  if (!sid) return;
+  const s = (await getSessions())[sid];
+  if (!s) return;
+  const mark = s.groupRetry ? Number(s.groupRetry[String(tabId)]) || 0 : 0;
+  if (mark < 1) {
+    // No failure on record: nothing to heal. A tab that sits in a group
+    // still goes through the sync, which is what follows group-id
+    // rotation and adopts an orphaned group carrying the chat's title
+    // (one our cache lost) when an event was missed.
+    if (tab.groupId != null && tab.groupId !== -1) syncTabGroupMembership(tabId);
+    return;
+  }
+  if (mark > GROUP_RETRY_MAX) return; // bounded: stopped; the panel state says so
+  if (tab.groupId != null && tab.groupId !== -1) {
+    const g = await chrome.tabGroups.get(tab.groupId).catch(() => null);
+    if (g && g.title === groupTitle(s)) {
+      await rememberGroup(sid, tab.windowId, tab.groupId);
+      await clearGroupRetry(sid, tabId);
+      await clearGroupError(sid);
+    }
+    return; // in some other group: the sync's adopt/release rules own that case
+  }
+  await groupTab(sid, tab);
+}
+chrome.tabs.onActivated.addListener((info) => {
+  if (info && info.tabId != null) retryGrouping(info.tabId).catch(() => {});
+});
+if (chrome.windows && chrome.windows.onFocusChanged) chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId == null || windowId < 0) return; // no window focused
+  (async () => {
+    const ts = await chrome.tabs.query({ windowId }).catch(() => []);
+    for (const t of ts) await retryGrouping(t.id);
+  })().catch(() => {});
 });
 if (chrome.tabs.onAttached) chrome.tabs.onAttached.addListener((tabId) => {
   syncTabGroupMembership(tabId);
@@ -622,10 +795,33 @@ chrome.tabGroups.onRemoved.addListener(async (g) => {
   const sessions = await getSessions();
   for (const [sid, s] of Object.entries(sessions)) {
     if (!s.groups || !Object.values(s.groups).map(Number).includes(g.id)) continue;
-    await withState((st) => {
+    // Rotation race: Chrome may recreate a group under a new id and
+    // remove the old one before the membership sync reads the cache —
+    // the sync then follows the new id but rememberGroup finds no
+    // previous id to trace. So: find the candidate first (a tab of this
+    // chat already sitting in this window in a group carrying the
+    // chat's title under a different id), then let the state write
+    // below decide who traces it. Both writes ride the same serial
+    // chain: if rememberGroup's overwrite landed first, this delete
+    // finds nothing for this window and the sync's trace stands; if
+    // this delete lands first, rememberGroup finds no previous id and
+    // this trace stands. Exactly one, either way.
+    let rotatedTo = null;
+    for (const id of tabIdsOf(s)) {
+      const t = await chrome.tabs.get(id).catch(() => null);
+      if (!t || t.windowId !== g.windowId || t.groupId == null || t.groupId === -1 || t.groupId === g.id) continue;
+      const ng = await chrome.tabGroups.get(t.groupId).catch(() => null);
+      if (ng && ng.title === groupTitle(s)) { rotatedTo = t.groupId; break; }
+    }
+    const removedHere = await withState((st) => {
       const v = st[sid];
-      if (v && v.groups) for (const w of Object.keys(v.groups)) if (Number(v.groups[w]) === g.id) delete v.groups[w];
+      let hit = false;
+      if (v && v.groups) for (const w of Object.keys(v.groups)) if (Number(v.groups[w]) === g.id) { delete v.groups[w]; if (Number(w) === g.windowId) hit = true; }
+      return hit;
     });
+    if (rotatedTo != null && removedHere) {
+      await audit(s.chatName, "tab group", "the group id for this window changed (" + g.id + " → " + rotatedTo + "); following the new id", "ok").catch(() => {});
+    }
     for (const id of tabIdsOf(s)) syncTabGroupMembership(id);
   }
 });
@@ -3253,7 +3449,26 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
           const tabsList = tids.map((t) => ({ tabId: t.id, host: P.hostOf(t.url), title: t.title || "",
             windowId: t.windowId, here: typeof msg.windowId === "number" ? t.windowId === msg.windowId : null }));
           const view = liveViews.get(sid);
+          // Group state, computed live: a chat's tabs are "grouped" only
+          // when every one of them sits in a group carrying the chat's
+          // title. The last grouping failure (error text + window type)
+          // rides along from the session record, so a missing group is
+          // visible in the panel for as long as it is missing.
+          const title = groupTitle(s);
+          const ownGroup = new Map();
+          for (const t of tids) {
+            if (t.groupId == null || t.groupId === -1 || ownGroup.has(t.groupId)) continue;
+            const g = await chrome.tabGroups.get(t.groupId).catch(() => null);
+            ownGroup.set(t.groupId, !!(g && g.title === title));
+          }
+          const grouped = tids.length > 0 && tids.every((t) => t.groupId != null && t.groupId !== -1 && ownGroup.get(t.groupId));
+          const groupStopped = tids.some((t) => (t.groupId == null || t.groupId === -1)
+            && s.groupRetry && Number(s.groupRetry[String(t.id)]) > GROUP_RETRY_MAX);
           chats.push({ sessionId: sid, chatName: s.chatName, tabs: tids.length, tabsHere, tabsList, sites: Object.keys(s.sites),
+            grouped, groupMissing: tids.length > 0 && !grouped,
+            groupError: s.groupError ? String(s.groupError.text || "") : "",
+            groupWindowType: s.groupError ? String(s.groupError.windowType || "") : "",
+            groupStopped,
             view: view ? { tabId: view.tabId, at: view.at, image: view.image || null, blocked: view.blocked || null } : null });
         }
         return { ok: true, relay: { connected: wsReady, url: DEFAULT_RELAY, error: await local.get("relayError", ""),
@@ -3366,7 +3581,7 @@ chrome.runtime.onStartup.addListener(setup);
 // fire onStartup, so this never fires mid-session.
 chrome.runtime.onStartup.addListener(async () => {
   memTabs.clear(); memOwner.clear();
-  await withState((s) => { for (const v of Object.values(s)) { v.tabs = {}; v.groups = {}; } });
+  await withState((s) => { for (const v of Object.values(s)) { v.tabs = {}; v.groups = {}; delete v.groupError; delete v.groupMoved; delete v.groupRetry; } });
   await adoptGroupTabsAtStartup();
   for (const sid of Object.keys(await getSessions())) await dropIfEmpty(sid, "browser restarted with no tabs in the group");
 });
