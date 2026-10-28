@@ -1028,8 +1028,26 @@
     return { host: location.host.toLowerCase(), v: run.call(this) };
   }
 
+  /* The managed blocked-URL pattern matcher, ported line for line
+   * from Claude in Chrome's (its Nt): the URL side is the lowercase
+   * hostname (trailing dot and leading "www." stripped) plus the
+   * lowercase path; the pattern side is lowercased, scheme- and
+   * www-stripped, trailing dot on the host segment stripped, a
+   * trailing "/" becomes "/*", and a bare domain gains "/*". "*" is
+   * the only wildcard; everything else is literal, anchored. */
+  function matchBlockedPattern(url, pattern) {
+    let n;
+    try { n = new URL(/^https?:\/\//.test(url) ? url : "https://" + url); } catch (e) { return false; }
+    const r = n.hostname.toLowerCase().replace(/\.$/, "").replace(/^www\./, "") + n.pathname.toLowerCase();
+    let s = String(pattern).toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "")
+      .replace(/^([^/]*)\.(?=\/|$)/, "$1").replace(/\/$/, "/*");
+    if (!s.includes("/")) s += "/*";
+    const i = s.split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+    return new RegExp("^" + i + "$").test(r);
+  }
+
   const api = { hostOf, isWebUrl, classifyTarget, classifyClick, classifyActivation, classifyTyping,
-                classifyFormInput, classifyFormFill, isSecretField,
+                classifyFormInput, classifyFormFill, isSecretField, matchBlockedPattern,
                 describeTarget, shownTyping, parseKeys, isActivationKey, isTypingKey, keyName, parseRef,
                 INTERACTIVE_ROLES, ACTION_ROLES, rankForQuery, clip, RISK_RE, pageProbe, luhnValid, redactText, normalizeLabel,
                 PROBE_ARGS: { risk: [RISK_RE.source, RISK_RE.flags] } };
