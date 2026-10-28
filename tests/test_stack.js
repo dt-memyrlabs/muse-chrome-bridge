@@ -66,10 +66,23 @@ const PY = process.env.MBB_PY || "/home/hatch/workspace/mbb-test/venv/bin/python
       return { tab: t, ok: r.ok, code: s.share && s.share.code };
     };
 
+    // v2.7: a pair completes only on the ONE full-control confirmation
+    // in the side panel — the relay waits for the extension's ack,
+    // which follows the user's Allow. Drive it the way the user does.
+    const confirmShare = async () => {
+      for (let i = 0; i < 200; i++) {
+        const sp = ((await panel("state")).prompts || []).find((p) => /full control/i.test(p.title));
+        if (sp) { await panel("approve", { id: sp.id }); return true; }
+        await tick(50);
+      }
+      return false;
+    };
+    const pairFlow = (name, code) => { const p = as(name, "pair", code, "--chat", name); return confirmShare().then(() => p); };
+
     const A = await shareCode("https://shop.example.com/admin");
     check("Share gets an 8-character code from the relay", A.ok && /^[A-Z2-9]{8}$/.test(A.code || ""), A);
 
-    let r = await as("Chat A", "pair", A.code, "--chat", "Chat A");
+    let r = await pairFlow("Chat A", A.code);
     check("chat pairs with the code through the client", r.ok === true && r._exit === 0, r);
     const sidA = r.sessionId;
     check("the token is saved in the chat's own working folder", fs.existsSync(path.join(chatDir("Chat A"), ".muse-bridge-token")));
@@ -83,7 +96,7 @@ const PY = process.env.MBB_PY || "/home/hatch/workspace/mbb-test/venv/bin/python
     check("chat A's command reaches the extension and returns its tab", r.ok && r.data.tabs.length === 1 && r.data.tabs[0].tabId === A.tab.id, r);
 
     const B = await shareCode("https://mail.example.org/");
-    await as("Chat B", "pair", B.code, "--chat", "Chat B");
+    await pairFlow("Chat B", B.code);
     await tick(200);
     r = await as("Chat A", "get_page_text", JSON.stringify({ tabId: B.tab.id }));
     check("chat A cannot reach chat B's tab through the real relay", r.ok === false && r.error === "tab_not_shared", r);
@@ -99,7 +112,7 @@ const PY = process.env.MBB_PY || "/home/hatch/workspace/mbb-test/venv/bin/python
     const C = await shareCode("https://crm.example.com/");
     const tokFileA = path.join(chatDir("Chat A"), ".muse-bridge-token");
     const tokBefore = fs.readFileSync(tokFileA, "utf8");
-    r = await as("Chat A", "pair", C.code, "--chat", "Chat A");
+    r = await pairFlow("Chat A", C.code);
     check("a connected chat redeeming a new code attaches to its session",
           r.ok === true && r.attached === true && r.sessionId === sidA && r._exit === 0, r);
     check("...its token file is unchanged", fs.readFileSync(tokFileA, "utf8") === tokBefore);
@@ -113,7 +126,9 @@ const PY = process.env.MBB_PY || "/home/hatch/workspace/mbb-test/venv/bin/python
     r = await as("Chat A", "pair", C.code, "--chat", "Chat A");
     check("the attached code is single-use too", r.ok === false && r.error === "bad_or_expired_code", r);
     const D = await shareCode("https://wiki.example.net/");
-    r = await run(chatDir("Chat A"), ["pair", D.code, "--chat", "Chat C", "--token-file", path.join(chatDir("Chat A"), "c.token")]);
+    const dP = run(chatDir("Chat A"), ["pair", D.code, "--chat", "Chat C", "--token-file", path.join(chatDir("Chat A"), "c.token")]);
+    await confirmShare();
+    r = await dP;
     check("...a chat can still pair fresh into its own --token-file", r.ok === true && !r.attached, r);
 
     r = await as("Chat A", "set_policy", JSON.stringify({ host: "x", policy: "allow" }));
@@ -123,14 +138,16 @@ const PY = process.env.MBB_PY || "/home/hatch/workspace/mbb-test/venv/bin/python
     r = await as("Chat A", "read_page", "{not json");
     check("bad JSON arguments -> bad_json, exit 2", r.error === "bad_json" && r._exit === 2, r);
 
-    // new site: the chat waits on Daniel's side-panel answer
-    const nav = as("Chat A", "navigate", JSON.stringify({ url: "https://docs.example.io/" }));
-    let prompts = [];
-    for (let i = 0; i < 100; i++) { prompts = (await panel("state")).prompts; if (prompts.length) break; await tick(50); }
-    check("a new site shows a prompt in the side panel", prompts.length === 1 && /docs\.example\.io/.test(prompts[0].title), prompts);
-    await panel("approve", { id: prompts[0].id });
-    r = await nav;
-    check("after Allow the chat's navigate completes in a tab of its own", r.ok && (await owner(r.data.tabId)) === "Chat A", r);
+    // new site: under v2.7 the chat does NOT wait on a side-panel
+    // answer — the share was the consent. The navigate completes at
+    // once, in a tab of the chat's own, and the site's first use is
+    // written to the panel's event record.
+    r = await as("Chat A", "navigate", JSON.stringify({ url: "https://docs.example.io/" }));
+    check("a new site opens with no prompt in the side panel", r.ok && (await panel("state")).prompts.length === 0, r);
+    check("the chat's navigate completes in a tab of its own", r.ok && (await owner(r.data.tabId)) === "Chat A", r);
+    const navEv = (await panel("state")).audit.filter((x) => x.action === "site allowed" && /docs\.example\.io/.test(x.detail));
+    check("...and the new site's first use is in the event record",
+          navEv.length === 1 && navEv[0].outcome === "no prompt: full control", navEv);
 
     // screenshots become files, each with its own name, also inside a batch
     r = await as("Chat A", "screenshot", JSON.stringify({ tabId: A.tab.id }));
