@@ -39,8 +39,13 @@ function install({ relayUrl, fakeSocket = true } = {}) {
     tabsUpdated: event(), tabsRemoved: event(), groupsRemoved: event(), groupsUpdated: event(),
     runtimeMsg: event(), tabsAttached: event(), tabsDetached: event(),
     alarm: event(), installed: event(), startup: event(), notifClicked: event(), dbgDetach: event(),
-    tabsCreated: event(),
+    tabsCreated: event(), tabsActivated: event(), winFocus: event(),
   };
+  // Test knob for chrome.tabs.group failures beyond the window-type
+  // refusal below: a function ({tabIds, groupId, createProperties}) that
+  // returns an Error to throw, or null to let the call proceed.
+  const groupBox = { hook: null };
+  let nextOwnWindow = 5000; // windows created around an existing tab
   const pillOf = {};   // tabId -> chat name the pill shows (set through chrome.scripting)
   const cursorOf = {}; // tabId -> last cursor command the worker sent (through chrome.scripting)
   const captures = []; // every captureVisibleTab call: {windowId, at}
@@ -175,7 +180,8 @@ function install({ relayUrl, fakeSocket = true } = {}) {
         (q.lastFocusedWindow === undefined || !q.lastFocusedWindow || t.windowId === lastFocusedWindowId)).map((t) => ({ ...t })),
       create: async ({ url, windowId, active }) => ({ ...mkTab(url || "about:blank", { windowId, active: !!active }) }),
       update: async (id, { url }) => { setUrl(id, url); return { ...tabs.get(id) }; },
-      group: async ({ tabIds, groupId }) => {
+      group: async ({ tabIds, groupId, createProperties }) => {
+        if (groupBox.hook) { const err = groupBox.hook({ tabIds, groupId, createProperties }); if (err) throw err; }
         for (const id of tabIds) {
           const t = tabs.get(id);
           if (t && (windowTypes[t.windowId] || "normal") !== "normal") throw new Error("Grouping is not supported by tabs in this window.");
@@ -184,14 +190,19 @@ function install({ relayUrl, fakeSocket = true } = {}) {
         if (gid !== undefined && gid !== null) {
           const g = groups.get(gid);
           if (!g) throw new Error("No group with id: " + gid);
+          // Real Chrome moves a tab into the group's window when it is
+          // grouped into a group that lives in another window.
           for (const id of tabIds) {
             const t = tabs.get(id);
-            if (t && t.windowId !== g.windowId) throw new Error("group is in a different window");
+            if (t && t.windowId !== g.windowId) t.windowId = g.windowId;
           }
         } else {
           gid = nextGroup++;
           const first = tabs.get(tabIds[0]);
-          groups.set(gid, { id: gid, title: "", color: "grey", windowId: first ? first.windowId : 1, collapsed: false });
+          const winId = createProperties && createProperties.windowId !== undefined
+            ? createProperties.windowId : (first ? first.windowId : 1);
+          groups.set(gid, { id: gid, title: "", color: "grey", windowId: winId, collapsed: false });
+          for (const id of tabIds) { const t = tabs.get(id); if (t) t.windowId = winId; }
         }
         for (const id of tabIds) setGroup(id, gid);
         return gid;
@@ -205,6 +216,7 @@ function install({ relayUrl, fakeSocket = true } = {}) {
         return "data:image/jpeg;base64," + page.shot;
       },
       onUpdated: { addListener: (f) => E.tabsUpdated.addListener(f) },
+      onActivated: { addListener: (f) => E.tabsActivated.addListener(f) },
       onCreated: { addListener: (f) => E.tabsCreated.addListener(f) },
       onRemoved: { addListener: (f) => E.tabsRemoved.addListener(f) },
       onAttached: { addListener: (f) => E.tabsAttached.addListener(f) },
@@ -274,7 +286,25 @@ function install({ relayUrl, fakeSocket = true } = {}) {
       get: async (id) => ({ id, type: windowTypes[id] || "normal", incognito: false }),
       getAll: async () => [...new Set([1, ...[...tabs.values()].map((t) => t.windowId)])]
         .filter((id) => (windowTypes[id] || "normal") === "normal").map((id) => ({ id, type: "normal", incognito: false })),
-      create: async ({ url }) => { const w = 900 + nextGroup; const t = mkTab(url, { windowId: w }); return { id: w, tabs: [{ ...t }] }; },
+      create: async ({ url, tabId, type }) => {
+        if (tabId !== undefined && tabId !== null) {
+          // chrome.windows.create({tabId}): the tab moves into a window
+          // of its own — detached from the old window, ungrouped on the
+          // way (as any cross-window move), attached to the new one.
+          const t = tabs.get(Number(tabId));
+          if (!t) throw new Error("No tab with id: " + tabId);
+          const wid = ++nextOwnWindow;
+          windowTypes[wid] = type || "normal";
+          const oldWindowId = t.windowId;
+          E.tabsDetached.fire(t.id, { oldWindowId, oldPosition: 0 });
+          t.windowId = wid;
+          if (t.groupId !== -1) setGroup(t.id, -1);
+          E.tabsAttached.fire(t.id, { newWindowId: wid, newPosition: 0 });
+          return { id: wid, type: windowTypes[wid], tabs: [{ ...t }] };
+        }
+        const w = 900 + nextGroup; const t = mkTab(url, { windowId: w }); return { id: w, tabs: [{ ...t }] };
+      },
+      onFocusChanged: { addListener: (f) => E.winFocus.addListener(f) },
     },
   };
 
@@ -296,7 +326,7 @@ function install({ relayUrl, fakeSocket = true } = {}) {
   const panel = (kind, extra, sender = PANEL) => new Promise((resolve) => {
     E.runtimeMsg.fire({ kind, ...(extra || {}) }, sender, resolve);
   });
-  return { tabs, groups, sent, cdpLog, inputs, notifications, windowTypes, pillOf, cursorOf, captures, E, page, mkTab, setGroup, setUrl, mkGroup, moveToWindow, FakeWS,
+  return { tabs, groups, sent, cdpLog, inputs, notifications, windowTypes, pillOf, cursorOf, captures, E, page, mkTab, setGroup, setUrl, mkGroup, moveToWindow, FakeWS, groupBox,
            setLastFocusedWindow: (id) => { lastFocusedWindowId = id; },
            panel, sessionStore, localStore, sw: (expr) => vm.runInThisContext(expr) };
 }
