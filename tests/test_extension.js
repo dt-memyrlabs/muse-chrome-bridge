@@ -64,15 +64,27 @@ async function approveShare(allow = true) {
 async function pair(url, name) {
   const t = mkTab(url, { active: true });
   for (const x of tabs.values()) if (x.id !== t.id) x.active = false;
+  const reqsBefore = sent.filter((m) => m.t === "pair_request").length;
   const r = await panel("share", { tabId: t.id });
+  await approveShare(); // v2.9: the ONE confirmation is asked at code generation, before any code exists
+  for (let i = 0; i < 200; i++) { if (sent.filter((m) => m.t === "pair_request").length > reqsBefore) break; await tick(5); }
   const req = sent.filter((m) => m.t === "pair_request").pop();
   FakeWS.last.deliver({ t: "pair_code", reqId: req.reqId, code: "ABCD2345", expiresIn: 300 });
   await tick(10);
   const sid = "sess-" + name;
   FakeWS.last.deliver({ t: "paired", reqId: req.reqId, sessionId: sid, chatName: name });
-  await approveShare();
-  await tick(30);
+  await tick(30); // v2.9: redemption of the generation-confirmed code asks nothing
   return { tab: tabs.get(t.id), sid, shareOk: r && r.ok };
+}
+// v2.9 manual-section helper: generate a code for a tab (approving the
+// generation confirmation the way the user does) and return its
+// pair_request once the relay has been asked for the code.
+async function genReq(tabId) {
+  const before = sent.filter((m) => m.t === "pair_request").length;
+  await panel("share", { tabId });
+  await approveShare();
+  for (let i = 0; i < 200; i++) { if (sent.filter((m) => m.t === "pair_request").length > before) break; await tick(5); }
+  return sent.filter((m) => m.t === "pair_request").pop();
 }
 const clicks = () => inputs.filter((i) => i.method === "Input.dispatchMouseEvent" && i.params.type === "mousePressed").length;
 const keys = () => inputs.filter((i) => i.method === "Input.dispatchKeyEvent" && i.params.type !== "keyUp").length;
@@ -132,18 +144,20 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   r = await cmd(A.sid, "navigate", { url: "https://pay.example.com/other" });
   check("already-permitted site opens without asking", r.ok && (await pendingPrompts()).length === 0, r);
 
-  // The ONE prompt that remains is the share confirmation itself, and
-  // it still answers only to the real side panel. A fresh pair for
-  // Chat C is left waiting on its card for these checks.
+  // v2.9: the ONE prompt is the share confirmation itself, asked at
+  // code GENERATION — before any code is requested — and it still
+  // answers only to the real side panel. It cannot name a chat: none
+  // is known until a chat redeems the code, so it speaks of the chat
+  // the code will be handed to. Chat C's generation is left waiting
+  // on its card for these checks, then denied.
   const cTab = mkTab("https://c.example.com/", { active: true });
-  await panel("share", { tabId: cTab.id });
-  const cReq = sent.filter((m) => m.t === "pair_request").pop();
-  FakeWS.last.deliver({ t: "pair_code", reqId: cReq.reqId, code: "C2345678", expiresIn: 300 });
-  await tick(10);
-  FakeWS.last.deliver({ t: "paired", reqId: cReq.reqId, sessionId: "sess-Chat C", chatName: "Chat C" });
+  const cReqsBefore = sent.filter((m) => m.t === "pair_request").length;
+  const cShare = await panel("share", { tabId: cTab.id });
   let pr = await waitPrompt(1);
-  check("sharing a tab asks ONE full-control confirmation, naming the chat",
-        pr.length === 1 && /full control/i.test(pr[0].title) && pr[0].title.includes("Chat C"), pr);
+  check("generating a code asks ONE full-control confirmation, before any code is requested",
+        pr.length === 1 && /full control/i.test(pr[0].title) && /chat you hand this code to/i.test(pr[0].title) &&
+        sent.filter((m) => m.t === "pair_request").length === cReqsBefore &&
+        !(await F.sw(`local.get("shares", {})`))[cShare.reqId].code, pr);
   const fromPage = await panel("approve", { id: pr[0].id }, { id: "extid", url: "https://evil.example/", tab: { id: 5 } });
   check("approve from a web page / content script is refused", fromPage && fromPage.error === "forbidden", fromPage);
   const fromOther = await panel("approve", { id: pr[0].id }, { id: "otherext", url: "chrome-extension://otherext/x.html" });
@@ -151,6 +165,13 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   check("prompt still pending after forged approvals", (await pendingPrompts()).length === 1);
   await panel("deny", { id: pr[0].id });
   await tick(30);
+  check("denying at generation issues no code: no pair request, the share entry is discarded, the panel share is gone",
+        sent.filter((m) => m.t === "pair_request").length === cReqsBefore &&
+        !(await F.sw(`local.get("shares", {})`))[cShare.reqId] &&
+        !(await panel("state")).share, (await panel("state")).share);
+  const cDenyEv = (await panel("state")).audit.filter((x) => x.action === "code not generated" && /c\.example\.com/.test(x.detail));
+  check("...and the refusal is written to the event record",
+        cDenyEv.length === 1 && /denied_by_user/.test(cDenyEv[0].outcome), cDenyEv);
   // navigate to the page a tab is already on never reloads it; active:true only brings it forward
   let setUrls = 0;
   const origUpdate = chrome.tabs.update;
@@ -506,31 +527,57 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   check("a token-file upload is still refused outright, with no prompt",
         !r.ok && r.error === "upload_blocked" && (await pendingPrompts()).length === 0, r);
 
-  /* ---- the v2.7 share confirmation, end to end ---- */
-  // Chat C's pair was denied back at the navigate section: the tab was
-  // never shared, no session exists, and the nack said why.
+  /* ---- the share confirmation, end to end (v2.9) ---- */
+  // Chat C's generation was denied back at the navigate section: no
+  // code was ever issued, so there was never a pairing to nack; the
+  // tab was never shared and no session exists.
   const cNack = sent.filter((m) => m.t === "paired_nack" && m.sessionId === "sess-Chat C").pop();
-  check("a denied confirmation: the pair is nacked as denied_by_user and the tab was never shared",
-        !!cNack && /denied_by_user/.test(cNack.error || "") && !(await owner(cTab.id)) &&
+  check("a generation denial: no pair, no nack, the tab was never shared, no session exists",
+        !cNack && !(await owner(cTab.id)) &&
         !(await F.sw(`local.get("sessions", {})`))["sess-Chat C"], cNack);
-  // A pair does not complete before its confirmation: no ack, no
-  // session, tab unshared — until Allow.
+  // A generation-confirmed code redeems with NO card and completes.
   const eTab = mkTab("https://e.example.com/", { active: true });
+  const eReqsBefore = sent.filter((m) => m.t === "pair_request").length;
   await panel("share", { tabId: eTab.id });
+  pr = await waitPrompt(1);
+  check("setup: the generation card is up and no code has been requested yet",
+        pr.length === 1 && sent.filter((m) => m.t === "pair_request").length === eReqsBefore, pr);
+  await panel("approve", { id: pr[0].id });
+  for (let i = 0; i < 200; i++) { if (sent.filter((m) => m.t === "pair_request").length > eReqsBefore) break; await tick(5); }
   const eReq = sent.filter((m) => m.t === "pair_request").pop();
   FakeWS.last.deliver({ t: "pair_code", reqId: eReq.reqId, code: "E2345678", expiresIn: 300 });
   await tick(10);
   const eSent = sent.length;
   FakeWS.last.deliver({ t: "paired", reqId: eReq.reqId, sessionId: "sess-Chat E", chatName: "Chat E" });
+  await tick(50);
+  check("redemption of a generation-confirmed code shows no card and completes: ack sent, session created, tab shared",
+        (await pendingPrompts()).length === 0 &&
+        sent.slice(eSent).some((m) => m.t === "paired_ack" && m.sessionId === "sess-Chat E") && (await owner(eTab.id)) === "Chat E");
+  const eConfEv = (await panel("state")).audit.filter((x) => x.action === "share confirmed" && /e\.example\.com/.test(x.detail));
+  check("...and the event record shows consent was given when the code was generated",
+        eConfEv.length === 1 && /confirmed when the code was generated/.test(eConfEv[0].outcome), eConfEv);
+  // Fallback: a share created by another path (no generation flag)
+  // still cards at redemption, naming the chat, and the pair does not
+  // complete before that confirmation.
+  const fTab = mkTab("https://f.example.com/", { active: true });
+  const fReqId = await F.sw(`startShare(${fTab.id})`);
+  await tick(20);
+  check("fallback setup: an unconfirmed share requests its code with no generation card",
+        sent.some((m) => m.t === "pair_request" && m.reqId === fReqId) && (await pendingPrompts()).length === 0);
+  FakeWS.last.deliver({ t: "pair_code", reqId: fReqId, code: "F2345678", expiresIn: 300 });
+  await tick(10);
+  const fSent = sent.length;
+  FakeWS.last.deliver({ t: "paired", reqId: fReqId, sessionId: "sess-Chat F", chatName: "Chat F" });
   pr = await waitPrompt(1);
   await tick(30);
-  check("a pair does not complete before the confirmation (no ack sent, no session, tab unshared)",
-        pr.length === 1 && !sent.slice(eSent).some((m) => m.t === "paired_ack" && m.sessionId === "sess-Chat E") &&
-        !(await owner(eTab.id)) && !(await F.sw(`local.get("sessions", {})`))["sess-Chat E"], pr);
+  check("a fallback (unconfirmed) share still cards at redemption, naming the chat, and does not complete before it",
+        pr.length === 1 && pr[0].title.includes("Chat F") &&
+        !sent.slice(fSent).some((m) => m.t === "paired_ack" && m.sessionId === "sess-Chat F") &&
+        !(await owner(fTab.id)) && !(await F.sw(`local.get("sessions", {})`))["sess-Chat F"], pr);
   await panel("approve", { id: pr[0].id });
   await tick(30);
-  check("...and Allow completes it: ack sent, session created, tab shared",
-        sent.slice(eSent).some((m) => m.t === "paired_ack" && m.sessionId === "sess-Chat E") && (await owner(eTab.id)) === "Chat E");
+  check("...and Allow at redemption completes the fallback pair",
+        sent.slice(fSent).some((m) => m.t === "paired_ack" && m.sessionId === "sess-Chat F") && (await owner(fTab.id)) === "Chat F");
   // Exactly one card per share: two panel gives for the same tab+chat
   // while a card is up stack no second card.
   const oneTab = mkTab("https://one.example.com/", { active: true });
@@ -543,20 +590,25 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   await panel("approve", { id: pr[0].id });
   await Promise.all([o1, o2]);
   check("...and the tab lands once, with the chat", (await owner(oneTab.id)) === "Chat A");
-  // Unshare, then share again: the confirmation is asked again.
+  // Unshare, then generate again: the confirmation is asked again —
+  // every Generate click is a new copy moment (v2.9).
   await panel("remove_tab", { tabId: eTab.id });
   check("setup: unsharing ends the grant", !(await owner(eTab.id)));
+  const e2ReqsBefore = sent.filter((m) => m.t === "pair_request").length;
   await panel("share", { tabId: eTab.id });
+  pr = await waitPrompt(1);
+  check("re-generating after an unshare asks the confirmation again, at generation",
+        pr.length === 1 && /full control/i.test(pr[0].title) && /chat you hand this code to/i.test(pr[0].title) &&
+        sent.filter((m) => m.t === "pair_request").length === e2ReqsBefore, pr);
+  await panel("approve", { id: pr[0].id });
+  for (let i = 0; i < 200; i++) { if (sent.filter((m) => m.t === "pair_request").length > e2ReqsBefore) break; await tick(5); }
   const e2Req = sent.filter((m) => m.t === "pair_request").pop();
   FakeWS.last.deliver({ t: "pair_code", reqId: e2Req.reqId, code: "E2345679", expiresIn: 300 });
   await tick(10);
   FakeWS.last.deliver({ t: "paired", reqId: e2Req.reqId, sessionId: "sess-Chat E", chatName: "Chat E", attach: true });
-  pr = await waitPrompt(1);
-  check("re-sharing after an unshare asks the confirmation again",
-        pr.length === 1 && /full control/i.test(pr[0].title), pr);
-  await panel("approve", { id: pr[0].id });
-  await tick(30);
-  check("...and the re-share lands on Allow", (await owner(eTab.id)) === "Chat E");
+  await tick(50);
+  check("...and the re-generated code redeems with no second card and lands",
+        (await pendingPrompts()).length === 0 && (await owner(eTab.id)) === "Chat E");
 
   /* ---- deadlines and cancel ---- */
   // Cancel still stops a call in flight: a scroll whose wheel Chrome
@@ -573,19 +625,19 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   r = await cmd(A.sid, "navigate", { url: "https://new-site.example/" }, { ttlMs: 5000 });
   check("with too little time left, a new site simply opens (no_time_to_ask is gone with the prompts)",
         r.ok && (await pendingPrompts()).length === 0, r);
-  // The one prompt left — the share confirmation — carries its own
-  // ~90-second window, longer than any action prompt ever had.
+  // The generation confirmation carries its own ~90-second window,
+  // longer than any action prompt ever had.
   const dTab = mkTab("https://d.example.com/", { active: true });
-  await panel("share", { tabId: dTab.id });
-  const dReq = sent.filter((m) => m.t === "pair_request").pop();
-  FakeWS.last.deliver({ t: "pair_code", reqId: dReq.reqId, code: "D2345678", expiresIn: 300 });
-  await tick(10);
-  FakeWS.last.deliver({ t: "paired", reqId: dReq.reqId, sessionId: "sess-Chat D", chatName: "Chat D" });
+  const dReqsBefore = sent.filter((m) => m.t === "pair_request").length;
+  const dShare = await panel("share", { tabId: dTab.id });
   pr = await waitPrompt(1);
-  check("the share confirmation shows its own ~90-second window",
+  check("the generation confirmation shows its own ~90-second window",
         pr.length === 1 && pr[0].expiresAt - Date.now() > 60000 && pr[0].expiresAt - Date.now() <= 90000, pr);
   await panel("deny", { id: pr[0].id });
   await tick(30);
+  check("...and denying it issues no code for that share",
+        sent.filter((m) => m.t === "pair_request").length === dReqsBefore &&
+        !(await F.sw(`local.get("shares", {})`))[dShare.reqId]);
 
   /* ---- result size ---- */
   const bigText = page.text;
@@ -610,13 +662,11 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
 
   /* ---- reconnect: both sides agree ---- */
   const G = await pair("https://gone.example.com/", "Chat G");
-  await panel("share", { tabId: loose.id });
-  const deadShare = sent.filter((m) => m.t === "pair_request").pop().reqId;
+  const deadShare = (await genReq(loose.id)).reqId;
   FakeWS.last.deliver({ t: "pair_code", reqId: deadShare, code: "DEAD2345", expiresIn: 300 });
   await tick(10);
   const noCode = mkTab("https://nocode.example.com/");
-  await panel("share", { tabId: noCode.id });
-  const waitingShare = sent.filter((m) => m.t === "pair_request").pop().reqId;
+  const waitingShare = (await genReq(noCode.id)).reqId;
   await F.sw(`local.set("inflight", { "old-cmd": "some-old-worker" })`);
   for (const k of Object.keys(F.sessionStore)) delete F.sessionStore[k]; // an extension reload wipes storage.session
   sb = sent.length;
@@ -639,8 +689,7 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   FakeWS.last.readyState = 1;
 
   // relay refused a code
-  await panel("share", { tabId: lone.id });
-  const refusedReq = sent.filter((m) => m.t === "pair_request").pop().reqId;
+  const refusedReq = (await genReq(lone.id)).reqId;
   FakeWS.last.deliver({ t: "pair_error", reqId: refusedReq, error: "too_many_codes" });
   await tick(20);
   const st2 = await panel("state");
@@ -673,8 +722,7 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   // pairing refused if the page changed before the code was used
   const Dp = mkTab("https://a.example.com/", { active: true });
   for (const x of tabs.values()) if (x.id !== Dp.id) x.active = false;
-  await panel("share", { tabId: Dp.id });
-  const req = sent.filter((m) => m.t === "pair_request").pop();
+  const req = await genReq(Dp.id);
   setUrl(Dp.id, "https://b.example.com/");
   const sd = sent.length;
   FakeWS.last.deliver({ t: "paired", reqId: req.reqId, sessionId: "sess-D2", chatName: "D" });
@@ -692,12 +740,14 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   // any tab in any window can be shared as it is: an app window too (no groups, no copies)
   const Pw = mkTab("https://pwa.example.com/app", { active: true, windowId: 7 });
   F.windowTypes[7] = "app";
+  const pwReqsBefore = sent.filter((m) => m.t === "pair_request").length;
   const rsw = await panel("share", { tabId: Pw.id });
   check("a page in an app window can be shared", rsw && rsw.ok, rsw);
+  await approveShare(); // v2.9: generation confirmation
+  for (let i = 0; i < 200; i++) { if (sent.filter((m) => m.t === "pair_request").length > pwReqsBefore) break; await tick(5); }
   const pwReq = sent.filter((m) => m.t === "pair_request").pop().reqId;
   sn = sent.length;
   FakeWS.last.deliver({ t: "paired", reqId: pwReq, sessionId: "sess-PW", chatName: "Pwa" });
-  await approveShare();
   await tick(60);
   check("...the tab itself becomes the chat's, with its pill, and the pairing succeeds",
         (await owner(Pw.id)) === "Pwa" && pillOn(Pw.id) === "Pwa" && sent.slice(sn).some((m) => m.t === "paired_ack" && m.sessionId === "sess-PW"), sent.slice(sn));
@@ -706,8 +756,7 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
 
   // a code the relay still holds survives a reconnect; the chat can use it
   const K = mkTab("https://keep.example.com/", { active: true });
-  await panel("share", { tabId: K.id });
-  const keepReq = sent.filter((m) => m.t === "pair_request").pop().reqId;
+  const keepReq = (await genReq(K.id)).reqId;
   FakeWS.last.deliver({ t: "pair_code", reqId: keepReq, code: "KEEP2345", expiresIn: 300 });
   await tick(20);
   FakeWS.last.deliver({ t: "welcome", ok: true, sessions: Object.keys(await F.sw(`local.get("sessions", {})`)), reqIds: [keepReq] });
@@ -717,8 +766,7 @@ const plain = { tag: "button", text: "Show details", fp: "button|details" };
   for (const k of Object.keys(F.sessionStore)) delete F.sessionStore[k];
   sn = sent.length;
   FakeWS.last.deliver({ t: "paired", reqId: keepReq, sessionId: "sess-K", chatName: "Keeper" });
-  await approveShare();
-  await tick(60);
+  await tick(60); // v2.9: the code was confirmed at generation; redemption asks nothing
   check("a code shown before an extension reload still pairs after it",
         sent.slice(sn).some((m) => m.t === "paired_ack" && m.sessionId === "sess-K") && (await owner(K.id)) === "Keeper",
         sent.slice(sn));

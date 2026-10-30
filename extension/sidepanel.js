@@ -126,6 +126,10 @@ async function refresh() {
     pg.append(el("div", { class: "site" }, c.host),
       el("p", { class: "muted" }, st.share.stalled ? `No answer from the relay. Cancel and try again.` : `Giving this tab to ${st.share.viaChat}…`),
       el("div", { class: "row" }, cancel()));
+  } else if (st.share && st.share.awaitingConfirmation) {
+    pg.append(el("div", { class: "site" }, c.host),
+      el("p", { class: "muted" }, "Waiting for your answer to the confirmation above. The code appears here after you tap Allow — the chat gets the tab with no more questions."),
+      el("div", { class: "row" }, cancel()));
   } else if (st.share && st.share.code) {
     const mins = Math.max(0, Math.round((st.share.expires - Date.now()) / 60000));
     pg.append(
@@ -133,7 +137,7 @@ async function refresh() {
       el("p", { class: "muted" }, "Paste this code into the Muse chat that should control this page:"),
       el("div", { class: "code" }, st.share.code.slice(0, 4) + "-" + st.share.code.slice(4)),
       el("p", { class: "copied" }, copied[st.share.reqId] || ""),
-      el("p", { class: "muted" }, "Using this code lets that chat take control of this tab — after you confirm once, here in this panel, that it gets full control. Stop sharing to end it."),
+      el("p", { class: "muted" }, "You already confirmed, when you generated this code, that the chat you give it to gets full control of this tab. It connects with no more questions. Stop sharing to end it."),
       el("p", { class: "muted" }, `Works once. Expires in about ${mins} min. Not connected until the chat uses it.`),
       el("div", { class: "row" },
         el("button", { onclick: () => copyText(st.share.code).then(() => { copied[st.share.reqId] = "Copied. Paste it into the Muse chat."; lastJson = ""; refresh(); }, () => {}) }, "Copy"),

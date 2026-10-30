@@ -4,7 +4,9 @@
  * its own group. Sharing a tab asks ONE confirmation in the side panel
  * that gives the chat full control of that tab; after it, actions inside
  * the tab are written to the panel's event record, never prompted
- * (v2.7). Input is real (chrome.debugger).
+ * (v2.7). For a code share, that confirmation is asked when the code
+ * is generated, not when the chat redeems it (v2.9). Input is real
+ * (chrome.debugger).
  * Independent open-source project; not a Meta or Anthropic product.
  *
  * What still gets checked before input reaches a page:
@@ -20,7 +22,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.8.0";
+const VERSION = "2.9.0";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -1115,22 +1117,71 @@ async function addTab(sessionId, tabId) {
 }
 
 /* --------------------------------------------------------------- pairing */
-async function startShare(tabId) {
+async function startShare(tabId, opts = {}) {
   const tab = await shareableTab(tabId);
-  if (!wsReady) throw fail("relay_offline", "the extension is not connected to the relay");
+  if (!wsReady || !ws || ws.readyState !== WebSocket.OPEN) throw fail("relay_offline", "the extension is not connected to the relay");
   const reqId = crypto.randomUUID();
+  // v2.9 (Daniel, 2026-10-30): the panel's Generate-a-code path asks the
+  // ONE full-control confirmation at generation time — when Daniel
+  // copies the code — not at redemption, when he may have moved on and
+  // forgotten the tab. Internal callers (the scheduled-prompt run)
+  // do not pass this flag: their shares keep the redemption-time card.
+  const confirmAtGeneration = !!(opts && opts.confirmAtGeneration);
   const dropped = [];
   await withShares((shares) => {
     for (const [rid, s] of Object.entries(shares)) if (s.tabId === tabId || s.expires < Date.now()) { dropped.push(rid); delete shares[rid]; }
-    shares[reqId] = { tabId, host: P.hostOf(tab.url), title: tab.title || "", code: "", created: Date.now(), expires: Date.now() + 300000 };
+    shares[reqId] = { tabId, host: P.hostOf(tab.url), title: tab.title || "", code: "", created: Date.now(), expires: Date.now() + 300000,
+                      ...(confirmAtGeneration ? { genConfirmPending: true, confirmedAtGeneration: false } : {}) };
   });
   // A replaced code stops counting toward the relay's open-code limit.
   if (dropped.length) relaySend({ t: "pair_cancel", reqIds: dropped });
-  if (!relaySend({ t: "pair_request", reqId })) {
-    await withShares((shares) => { delete shares[reqId]; });
-    throw fail("relay_offline");
+  if (!confirmAtGeneration) {
+    if (!relaySend({ t: "pair_request", reqId })) {
+      await withShares((shares) => { delete shares[reqId]; });
+      throw fail("relay_offline");
+    }
+    notifyPanel();
+    return reqId;
   }
   notifyPanel();
+  // The confirmation runs without blocking the panel's Generate click:
+  // the card sits in the panel's WAITING FOR YOU area while the share
+  // entry waits with no code. Only on Allow is a code requested from
+  // the relay, and the entry is marked confirmed at generation, so
+  // redemption completes with no second card. Deny or timeout: no code
+  // is ever requested, the entry is discarded, and the refusal is
+  // written to the event record.
+  (async () => {
+    try {
+      await confirmShareAtGeneration(tab, reqId);
+    } catch (e) {
+      let existed = false;
+      await withShares((shares) => { if (shares[reqId]) { existed = true; delete shares[reqId]; } });
+      if (existed) await audit("", "code not generated", P.hostOf(tab.url), "refused: " + ((e && e.code) || "canceled")).catch(() => {});
+      notifyPanel();
+      return;
+    }
+    // The entry may have been replaced by a newer Generate click (which
+    // joined this same card) or cancelled while the card was up: then
+    // this continuation owns nothing and must not request a code.
+    const entry = await withShares((shares) => shares[reqId] || null);
+    if (!entry) return;
+    // The tab may have moved while the card was up: generate for what
+    // it is now only if it is still on the site the card named.
+    const now = await chrome.tabs.get(tabId).catch(() => null);
+    if (!now || !P.isWebUrl(now.url) || P.hostOf(now.url) !== P.hostOf(tab.url)) {
+      await withShares((shares) => { delete shares[reqId]; });
+      await audit("", "code not generated", P.hostOf(tab.url), "refused: page_changed").catch(() => {});
+      notifyPanel();
+      return;
+    }
+    await withShares((shares) => { if (shares[reqId]) { shares[reqId].confirmedAtGeneration = true; shares[reqId].genConfirmPending = false; shares[reqId].confirmedAt = Date.now(); } });
+    if (!relaySend({ t: "pair_request", reqId })) {
+      await withShares((shares) => { delete shares[reqId]; });
+      await audit("", "code not generated", P.hostOf(tab.url), "refused: relay_offline").catch(() => {});
+    }
+    notifyPanel();
+  })().catch(() => {});
   return reqId;
 }
 
@@ -1201,13 +1252,21 @@ async function onPaired(msg) {
         return;
       }
       // v2.7: the tab joins only on the ONE full-control confirmation.
-      // The pair resolves after it — the relay's ack window covers the
-      // wait (SHARE_CONFIRM_MS < the relay's pair-ack timeout).
-      try { await confirmShare(msg.sessionId, (await getSessions())[msg.sessionId].chatName, tab); }
-      catch (e) {
-        await audit(msg.chatName, "tab attach", share.host, "refused: " + ((e && e.code) || "canceled"));
-        ack(false, shareRefusal(e));
-        return;
+      // v2.9: a code generated in the panel already carries that
+      // confirmation (given when the code was generated), so its
+      // redemption asks nothing. A share without the generation flag
+      // (created by any other path) still asks here — the pair
+      // resolves after it, and the relay's ack window covers the wait
+      // (SHARE_CONFIRM_MS < the relay's pair-ack timeout).
+      if (share.confirmedAtGeneration) {
+        await audit(msg.chatName, "share confirmed", share.host, "full control was confirmed when the code was generated; no card at redemption");
+      } else {
+        try { await confirmShare(msg.sessionId, (await getSessions())[msg.sessionId].chatName, tab); }
+        catch (e) {
+          await audit(msg.chatName, "tab attach", share.host, "refused: " + ((e && e.code) || "canceled"));
+          ack(false, shareRefusal(e));
+          return;
+        }
       }
       await withState((st) => { if (st[msg.sessionId]) st[msg.sessionId].sites[share.host] = true; });
       await attachTab(msg.sessionId, tab);
@@ -1246,20 +1305,27 @@ async function onPaired(msg) {
       return;
     }
     // v2.7: the pairing completes only on the ONE full-control
-    // confirmation. Until the user allows it, no session is created
-    // and the tab is not shared; the relay waits for this ack (its
-    // pair-ack window covers the confirmation's 90 s).
-    try { await confirmShare(msg.sessionId, P.clip(msg.chatName || "chat", 40), tab); }
-    catch (e) {
-      if (own(await getSessions(), msg.sessionId)) {
-        await audit(msg.chatName, "pair", "session already exists", "refused: session_exists");
-        ack(false, "session_exists: a session with this id is already connected; refusing to replace it");
+    // confirmation. v2.9: a panel-generated code already carries it
+    // (given when the code was generated), so redemption completes at
+    // once. A share without the generation flag still asks here:
+    // until the user allows it, no session is created and the tab is
+    // not shared; the relay waits for this ack (its pair-ack window
+    // covers the confirmation's 90 s).
+    if (share.confirmedAtGeneration) {
+      await audit(P.clip(msg.chatName || "chat", 40), "share confirmed", share.host, "full control was confirmed when the code was generated; no card at redemption");
+    } else {
+      try { await confirmShare(msg.sessionId, P.clip(msg.chatName || "chat", 40), tab); }
+      catch (e) {
+        if (own(await getSessions(), msg.sessionId)) {
+          await audit(msg.chatName, "pair", "session already exists", "refused: session_exists");
+          ack(false, "session_exists: a session with this id is already connected; refusing to replace it");
+          return;
+        }
+        relaySend({ t: "revoke", sessionId: msg.sessionId }); // refuse the pairing
+        await audit(msg.chatName, "pair", share.host, "refused: " + ((e && e.code) || "canceled"));
+        ack(false, shareRefusal(e));
         return;
       }
-      relaySend({ t: "revoke", sessionId: msg.sessionId }); // refuse the pairing
-      await audit(msg.chatName, "pair", share.host, "refused: " + ((e && e.code) || "canceled"));
-      ack(false, shareRefusal(e));
-      return;
     }
     const chatName = P.clip(msg.chatName || "chat", 40);
     let duplicate = false;
@@ -1623,6 +1689,26 @@ function confirmShare(sessionId, chat, tab) {
   return ask({ sessionId, chat, tabId: tab.id, job: null },
     `Give "${chat}" full control of this tab?`,
     `On ${host}, "${chat}" will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.`,
+    tab.url, { ms: SHARE_CONFIRM_MS, shareKey: key });
+}
+// v2.9: the generation-time form of the same ONE confirmation, asked
+// when Daniel clicks "Generate a code" — before any code exists, so
+// the chat is not known and the card must not name one: it speaks of
+// "the chat you hand this code to" instead. It runs under a synthetic
+// session id ("share:" + reqId): there is no session yet, and the
+// settle guard stays inert for it (ask() records hadTabs from the
+// mirror for that id — there is none — and the prompt names the tab,
+// so the tabless-prompt guard never applies). Exactly one card per
+// tab: a second Generate click while a card for that tab is up joins
+// the same answer (the shareKey dedupe pattern from confirmShare),
+// with its own share entry taking over once the answer lands.
+function confirmShareAtGeneration(tab, reqId) {
+  const key = "share-gen:" + tab.id;
+  for (const p of pending.values()) if (p.shareKey === key && p.promise) return p.promise;
+  const host = P.hostOf(tab.url);
+  return ask({ sessionId: "share:" + reqId, chat: "Code share", tabId: tab.id, job: null },
+    "Give the chat you hand this code to full control of this tab?",
+    `On ${host}, the chat you give this code to will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.`,
     tab.url, { ms: SHARE_CONFIRM_MS, shareKey: key });
 }
 // The nack text when a share's confirmation does not complete.
@@ -4623,7 +4709,9 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                                     startError: await local.get("relayStartError", "") },
                  current,
                  share: share ? { reqId: share[0], code: share[1].code, expires: share[1].expires,
-                                  stalled: !share[1].code && Date.now() - (share[1].created || 0) > 10000 } : null,
+                                  awaitingConfirmation: !!share[1].genConfirmPending,
+                                  confirmedAtGeneration: !!share[1].confirmedAtGeneration,
+                                  stalled: !share[1].code && !share[1].genConfirmPending && Date.now() - (share[1].created || 0) > 10000 } : null,
                  chats, prompts: [...pending].map(([id, p]) => ({ id, chat: p.chat, title: p.title, detail: p.detail, url: p.url, created: p.created, expiresAt: p.expiresAt })),
                  savedPrompts: await getSavedPrompts(),
                  promptRuns: (await local.get("promptRuns", [])).slice(-5).reverse().map((r) => ({
@@ -4635,7 +4723,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                  picking: !!(await sess.get("picking", null)),
                  audit: (await local.get("audit", [])).slice(-40).reverse() };
       }
-      case "share": return { ok: true, reqId: await startShare(Number(msg.tabId)) };
+      case "share": return { ok: true, reqId: await startShare(Number(msg.tabId), { confirmAtGeneration: true }) };
       case "add_tab": await addTab(String(msg.sessionId || ""), Number(msg.tabId)); return { ok: true };
       case "remove_tab": {
         const chat = await releaseTab(Number(msg.tabId));
@@ -4753,10 +4841,16 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         }
         return { ok: true, export: out };
       }
-      case "cancel_share":
-        await withShares((shares) => { delete shares[msg.reqId]; });
+      case "cancel_share": {
+        const cancelled = await withShares((shares) => { const s = shares[msg.reqId]; delete shares[msg.reqId]; return s || null; });
         relaySend({ t: "pair_cancel", reqIds: [String(msg.reqId)] });
+        // Cancelling a share whose generation confirmation is still up
+        // takes the card down with it: the share it belonged to is gone.
+        if (cancelled && cancelled.genConfirmPending) {
+          for (const [pid, p] of [...pending]) if (p.shareKey === "share-gen:" + cancelled.tabId) settle(pid, false, "canceled");
+        }
         return { ok: true };
+      }
       case "approve": settle(msg.id, true); return { ok: true };
       case "deny": settle(msg.id, false, "denied_by_user"); return { ok: true };
       case "disconnect": await dropSession(msg.sessionId, { tellRelay: true, why: "disconnected by you" }); return { ok: true };

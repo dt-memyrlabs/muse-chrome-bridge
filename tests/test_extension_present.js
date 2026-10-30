@@ -39,7 +39,10 @@ async function result(id, ms = 4000) {
 }
 const cmd = (sid, action, args) => result(cmdStart(sid, action, args));
 async function share(tabId) {
+  const reqsBefore = sent.filter((m) => m.t === "pair_request").length;
   await panel("share", { tabId });
+  await approveShare(); // v2.9: the ONE confirmation is asked at code generation, before any code exists
+  for (let i = 0; i < 200; i++) { if (sent.filter((m) => m.t === "pair_request").length > reqsBefore) break; await tick(5); }
   const req = sent.filter((m) => m.t === "pair_request").pop();
   FakeWS.last.deliver({ t: "pair_code", reqId: req.reqId, code: "ABCD2345", expiresIn: 300 });
   await tick(10);

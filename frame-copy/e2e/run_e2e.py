@@ -200,13 +200,18 @@ class PromptPump(threading.Thread):
         while not self.stop_flag:
             try:
                 st = self.panel.send("state", {"windowId": self.window_id})
+                # v2.9 evidence: record whether a pairing code already
+                # existed at the moment each card was approved. The one
+                # card of a code share must be approved BEFORE any code
+                # exists (it is the generation confirmation).
+                code_now = ((st or {}).get("share") or {}).get("code") or None
                 for p in (st or {}).get("prompts", []):
                     if p["id"] in seen:
                         continue
                     seen.add(p["id"])
                     r = self.panel.send("approve", {"id": p["id"]})
-                    self.approved.append(p)
-                    log(f"  [panel] APPROVED prompt: {p.get('title')!r} -- {p.get('detail')!r} -> {r}")
+                    self.approved.append({**p, "_codeAtApproval": code_now})
+                    log(f"  [panel] APPROVED prompt: {p.get('title')!r} -- {p.get('detail')!r} -> {r} (code at approval: {code_now!r})")
             except Exception as e:  # noqa: BLE001 - keep pumping
                 log(f"  [panel] pump hiccup: {e}")
             time.sleep(0.25)
@@ -394,9 +399,11 @@ def main():
         log(f"extension connected to relay: {st['relay']}")
 
         # ---- share the parent tab and get a pairing code -------------------
-        # The prompt pump starts BEFORE the pair: since v2.7.0 the pair
-        # itself waits on the one full-control confirmation card, so the
-        # rig-as-user must be answering the panel before pairing begins.
+        # The prompt pump starts BEFORE the share: since v2.9.0 the one
+        # full-control confirmation card is asked when the code is
+        # GENERATED (before any code exists), so the rig-as-user must be
+        # answering the panel before the share begins. Redemption of the
+        # generated code then asks nothing.
         pump = PromptPump(panel, window_id)
         pump.start()
         log("panel prompt pump running (auto-approves panel cards, logging each)")
@@ -418,6 +425,20 @@ def main():
         if not out.get("ok"):
             raise RuntimeError(f"client pair failed: {out}")
         log(f"chat paired as {out.get('chatName')!r} session {out.get('sessionId')}")
+
+        # v2.9 one-card evidence: the whole run so far must have raised
+        # exactly ONE card — the generation confirmation, approved
+        # before the code existed, worded for the chat the code is
+        # handed to. Redemption must have added no card.
+        time.sleep(1.0)  # let the pump observe any redemption card, if one were raised
+        gen = pump.approved
+        one_card_ok = (len(gen) == 1 and not gen[0].get("_codeAtApproval")
+                       and "hand this code to" in (gen[0].get("title") or ""))
+        results["generation-confirmation"] = one_card_ok
+        log(f"  one-card evidence: cards approved so far = {len(gen)}; "
+            f"first card title = {gen[0].get('title')!r} with code at approval = {gen[0].get('_codeAtApproval')!r}" if gen else
+            "  one-card evidence: NO card was approved — the generation confirmation never fired")
+        log(f"  => {'PASS' if one_card_ok else 'FAIL'} generation-confirmation (exactly one card, at generation, before the code existed)")
 
         rc, out = client(chatdir, "tabs_context", "{}")
         if not out.get("ok") or not out.get("data", {}).get("tabs"):
@@ -747,8 +768,14 @@ def main():
         else:
             log(f"--keep: chromium + relay left running; state in {tmp}")
 
+    # Whole-run one-card rule (v2.9): no later action may have raised a
+    # card either — the pump's total for the entire run must stay 1.
+    if pump and len(pump.approved) != 1:
+        results["generation-confirmation"] = False
+        log(f"one-card evidence FAILED for the whole run: {len(pump.approved)} cards approved in total")
+
     log("\n==== SUMMARY ====")
-    for name in ("framed-contenteditable", "framed-textarea", "parent-control",
+    for name in ("generation-confirmation", "framed-contenteditable", "framed-textarea", "parent-control",
                  "ref-cross-composer", "ref-framed-textarea", "ref-sameorigin-composer",
                  "background-framed-composer"):
         if name in results:

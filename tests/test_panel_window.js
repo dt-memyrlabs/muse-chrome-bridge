@@ -54,7 +54,15 @@ const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
   // A session owning a tab in window 2: tabsHere follows the panel's window,
   // so a panel in window 1 can say "tabs in another window" instead of
   // implying the chat is connected here with nothing under control.
+  const reqsBefore = F.sent.filter((m) => m.t === "pair_request").length;
   await F.panel("share", { tabId: workTab.id });
+  // v2.9: the ONE confirmation is asked at code generation, before any code exists.
+  for (let i = 0; i < 200; i++) {
+    const sp = ((await F.panel("state")).prompts || []).find((p) => /full control/i.test(p.title));
+    if (sp) { await F.panel("approve", { id: sp.id }); break; }
+    await tick(5);
+  }
+  for (let i = 0; i < 200; i++) { if (F.sent.filter((m) => m.t === "pair_request").length > reqsBefore) break; await tick(5); }
   const req = F.sent.filter((m) => m.t === "pair_request").pop();
   F.FakeWS.last.deliver({ t: "pair_code", reqId: req.reqId, code: "WXYZ9876", expiresIn: 300 });
   await tick(10);

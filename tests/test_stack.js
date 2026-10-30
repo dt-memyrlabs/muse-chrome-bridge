@@ -59,16 +59,10 @@ const PY = process.env.MBB_PY || "/home/hatch/workspace/mbb-test/venv/bin/python
     for (let i = 0; i < 100; i++) { st = await panel("state"); if (st.relay.connected) break; await tick(100); }
     check("extension connects to the real relay and is accepted", st.relay.connected, st.relay);
 
-    const shareCode = async (url) => {
-      const t = mkTab(url); for (const x of tabs.values()) x.active = x.id === t.id;
-      const r = await panel("share", { tabId: t.id });
-      let s; for (let i = 0; i < 100; i++) { s = await panel("state"); if (s.share && s.share.code) break; await tick(50); }
-      return { tab: t, ok: r.ok, code: s.share && s.share.code };
-    };
-
-    // v2.7: a pair completes only on the ONE full-control confirmation
-    // in the side panel — the relay waits for the extension's ack,
-    // which follows the user's Allow. Drive it the way the user does.
+    // v2.9: the ONE full-control confirmation is asked when the code
+    // is GENERATED — before any code exists — so shareCode drives it
+    // the way the user does: share, Allow the generation card, then
+    // read the code. Redemption of that code asks nothing.
     const confirmShare = async () => {
       for (let i = 0; i < 200; i++) {
         const sp = ((await panel("state")).prompts || []).find((p) => /full control/i.test(p.title));
@@ -77,7 +71,14 @@ const PY = process.env.MBB_PY || "/home/hatch/workspace/mbb-test/venv/bin/python
       }
       return false;
     };
-    const pairFlow = (name, code) => { const p = as(name, "pair", code, "--chat", name); return confirmShare().then(() => p); };
+    const shareCode = async (url) => {
+      const t = mkTab(url); for (const x of tabs.values()) x.active = x.id === t.id;
+      const r = await panel("share", { tabId: t.id });
+      await confirmShare();
+      let s; for (let i = 0; i < 100; i++) { s = await panel("state"); if (s.share && s.share.code) break; await tick(50); }
+      return { tab: t, ok: r.ok, code: s.share && s.share.code };
+    };
+    const pairFlow = (name, code) => as(name, "pair", code, "--chat", name);
 
     const A = await shareCode("https://shop.example.com/admin");
     check("Share gets an 8-character code from the relay", A.ok && /^[A-Z2-9]{8}$/.test(A.code || ""), A);
@@ -127,8 +128,7 @@ const PY = process.env.MBB_PY || "/home/hatch/workspace/mbb-test/venv/bin/python
     check("the attached code is single-use too", r.ok === false && r.error === "bad_or_expired_code", r);
     const D = await shareCode("https://wiki.example.net/");
     const dP = run(chatDir("Chat A"), ["pair", D.code, "--chat", "Chat C", "--token-file", path.join(chatDir("Chat A"), "c.token")]);
-    await confirmShare();
-    r = await dP;
+    r = await dP; // v2.9: D's code was confirmed at generation (in shareCode); redemption asks nothing
     check("...a chat can still pair fresh into its own --token-file", r.ok === true && !r.attached, r);
 
     r = await as("Chat A", "set_policy", JSON.stringify({ host: "x", policy: "allow" }));
