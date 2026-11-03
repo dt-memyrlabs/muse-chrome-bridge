@@ -10,6 +10,12 @@
  * the frame, prompts exactly as the root-world path does, and sets the
  * value by press-to-focus + insertText.
  *
+ * v2.10.4 adds the findability cases: a composer whose ONLY name
+ * source is data-placeholder (the Slate/Lexical editor pattern) is
+ * named by the real probe (run here under jsdom) and found by that
+ * text, and at an equal text score find hands back the real field
+ * before the noise that shares its words (a StaticText twin).
+ *
  *   node test_extension_framed_refs.js     exit 0 = all passed
  */
 "use strict";
@@ -95,6 +101,13 @@ const frameState = {
       isField: true, isPassword: true, fp: "input|pwd", cx: 200, cy: 300, w: 200, h: 24 },
     { i: 4, depth: 0, role: "checkbox", name: "Agree", tag: "input", type: "checkbox", text: "", label: "Agree",
       isField: true, checked: false, fp: "input|agree", cx: 20, cy: 340, w: 16, h: 16 },
+    // v2.10.4: the data-placeholder composer's shape as the fixed probe
+    // reports it, preceded in tree order by the StaticText that renders
+    // the same prompt words — the tie find must break for the field.
+    { i: 5, depth: 0, role: "StaticText", name: "Write your prompt", tag: "div", type: "", text: "Write your prompt", label: "",
+      isField: false, fp: "div|prompt-static", cx: 200, cy: 380, w: 300, h: 20 },
+    { i: 6, depth: 0, role: "textbox", name: "Write your prompt", tag: "div", type: "", text: "", label: "Write your prompt",
+      isField: true, isContentEditable: true, fp: "div|prompt-composer", cx: 200, cy: 420, w: 300, h: 40 },
   ],
 };
 
@@ -235,6 +248,82 @@ const frameState = {
   check("the top-frame Home button still clicks by node resolution at its measured point (100, 40)",
         r.ok && evH.some((e) => e.params.type === "mousePressed" && e.params.x === 100 && e.params.y === 40),
         evH.map((e) => [e.params.type, e.params.x, e.params.y]));
+
+  /* ---- 13. v2.10.4: find by the prompt text hands back the field ------
+   * The StaticText twin sits BEFORE the textbox in tree order and ties
+   * it on text score word for word; the framed entry's isField fact,
+   * carried into the flat list by buildTreeMerged, must put the real
+   * composer first — and the noise must still be listed, just after. */
+  r = await cmd("sess-A", "read_page", { tabId: T });
+  const tree13 = (r.data && r.data.tree) || "";
+  const lineMatch = (re) => tree13.split("\n").find((l) => re.test(l)) || "";
+  const dpBoxRef = (lineMatch(/^\s*textbox "Write your prompt"/).match(/\[(ref_\d+)\]/) || [])[1];
+  const dpStaticRef = (lineMatch(/^\s*StaticText "Write your prompt"/).match(/\[(ref_\d+)\]/) || [])[1];
+  check("read_page shows the data-placeholder composer as a textbox named by its prompt text, beside its StaticText twin",
+        !!dpBoxRef && !!dpStaticRef, tree13);
+  r = await cmd("sess-A", "find", { tabId: T, query: "write your prompt" });
+  const dpMatches = (r.data && r.data.matches) || [];
+  check("find \"write your prompt\" returns the framed textbox FIRST (field beats its StaticText twin at an equal score)",
+        dpMatches.length >= 2 && dpMatches[0].ref === dpBoxRef && dpMatches[0].role === "textbox" &&
+        dpMatches[0].name === "Write your prompt" && dpMatches[0].frame === FRAME_URL,
+        dpMatches);
+  check("...and the StaticText twin is still listed, after the field",
+        dpMatches.findIndex((m) => m.ref === dpStaticRef) > 0, dpMatches);
+
+  /* ---- 14. v2.10.4: the REAL probe names a data-placeholder composer --
+   * The harness fakes the probe, so the describe() fallback chain is
+   * proven against the real policy.js under jsdom: a contenteditable
+   * whose only name source is data-placeholder must enter the tree as
+   * textbox "Write your prompt". (jsdom does not implement
+   * isContentEditable; the fixture installs the standard
+   * attribute-chain semantics a real browser computes.) */
+  const { JSDOM } = require("jsdom");
+  const P14 = require("../extension/policy.js");
+  const dom = new JSDOM(`<!doctype html><html><body>
+    <div id="prompt-echo">Write your prompt</div>
+    <div id="composer" contenteditable="true" data-placeholder="Write your prompt"></div>
+  </body></html>`, { url: "https://chat.example.com/frame" });
+  Object.defineProperty(dom.window.HTMLElement.prototype, "isContentEditable", {
+    get() {
+      let n = this;
+      while (n && n.nodeType === 1) {
+        const v = n.getAttribute && n.getAttribute("contenteditable");
+        if (v !== null) return v === "" || v.toLowerCase() === "true";
+        n = n.parentElement;
+      }
+      return false;
+    },
+  });
+  const savedGlobals = { window: global.window, document: global.document, location: global.location };
+  global.window = dom.window; global.document = dom.window.document; global.location = dom.window.location;
+  let probeEntries = [];
+  try {
+    probeEntries = P14.pageProbe("tree", { ...P14.PROBE_ARGS, filter: "all", depth: 15, build: "t-dp" }).v.entries;
+  } finally {
+    global.window = savedGlobals.window; global.document = savedGlobals.document; global.location = savedGlobals.location;
+  }
+  const dpEntry = probeEntries.find((e) => e.isContentEditable);
+  check("the real probe enters the data-placeholder-only contenteditable as textbox \"Write your prompt\"",
+        !!dpEntry && dpEntry.role === "textbox" && dpEntry.name === "Write your prompt" && dpEntry.isField === true,
+        probeEntries);
+  const tie = P14.rankForQuery([
+    { ref: "ref_s", role: "StaticText", name: "Write your prompt" },
+    { ref: "ref_t", role: "textbox", name: "Write your prompt", isField: true, isContentEditable: true },
+  ], "write your prompt");
+  check("rankForQuery: at an equal text score the field beats the StaticText (probe facts carried)",
+        tie.length === 2 && tie[0].ref === "ref_t", tie.map((h) => h.ref));
+  const tieRoleOnly = P14.rankForQuery([
+    { ref: "ref_s", role: "StaticText", name: "Write your prompt" },
+    { ref: "ref_t", role: "textbox", name: "Write your prompt" },
+  ], "write your prompt");
+  check("rankForQuery: the textbox ROLE alone also wins the tie (AX-tree lines carry no facts)",
+        tieRoleOnly.length === 2 && tieRoleOnly[0].ref === "ref_t", tieRoleOnly.map((h) => h.ref));
+  const scoreWins = P14.rankForQuery([
+    { ref: "ref_t", role: "textbox", name: "Write", isField: true },
+    { ref: "ref_s", role: "StaticText", name: "Write your prompt" },
+  ], "write your prompt");
+  check("rankForQuery: a higher text score still beats a field (matching semantics unchanged)",
+        scoreWins.length === 2 && scoreWins[0].ref === "ref_s", scoreWins.map((h) => h.ref));
 
   console.log(`\n${passes}/${passes + failures} passed`);
   process.exit(failures ? 1 : 0);

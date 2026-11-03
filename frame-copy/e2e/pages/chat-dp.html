@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Data-placeholder framed chat</title>
+<style>
+  body { margin: 0; font-family: sans-serif; padding: 10px; }
+  #messages { border: 1px solid #999; min-height: 110px; padding: 6px; margin: 0 0 10px 0; }
+  #composer { border: 1px solid #333; min-height: 44px; padding: 6px; margin-bottom: 10px; }
+  /* How real editors (Slate/Lexical/ProseMirror) show the prompt: the
+   * text lives ONLY in the data-placeholder attribute and is rendered
+   * by CSS while the box is empty. No <label>, no aria-label, no
+   * placeholder attribute — data-placeholder is the composer's ONLY
+   * name source, which is exactly the shape find could not see before
+   * v2.10.4. */
+  #composer:empty::before { content: attr(data-placeholder); color: #888; pointer-events: none; }
+  #send-btn { padding: 6px 18px; }
+</style>
+</head>
+<body>
+  <h1>Chat page (origin B, data-placeholder composer)</h1>
+  <ul id="messages"></ul>
+
+  <div id="composer" contenteditable="true" data-placeholder="Write your prompt"></div>
+
+  <button id="send-btn">Send</button>
+
+<script>
+  const messagesEl = document.getElementById('messages');
+  const composer = document.getElementById('composer');
+
+  function report() {
+    parent.postMessage({
+      rig: 'frame-state',
+      page: 'dp',
+      origin: location.origin,
+      messages: [...messagesEl.querySelectorAll('li')].map((li) => li.textContent),
+      note: '',
+      composer: composer.textContent
+    }, '*');
+  }
+
+  document.getElementById('send-btn').addEventListener('click', () => {
+    const li = document.createElement('li');
+    li.textContent = composer.textContent;
+    messagesEl.appendChild(li);
+    composer.textContent = '';
+    report();
+  });
+
+  composer.addEventListener('input', report);
+  report();
+</script>
+</body>
+</html>

@@ -22,7 +22,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.10.3";
+const VERSION = "2.10.4";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -2541,7 +2541,7 @@ async function buildTreeMerged(tab, host, frames, { filter = "all", depth = 15, 
         frameUrl: frame.url, frameHost: P.hostOf(frame.url), buildId,
         idx: e.i, fp: e.fp, role: e.role, name: e.name, facts: e, point,
       });
-      const nd = mkNode(ref, e.role, e.name, { frameUrl: frame.url });
+      const nd = mkNode(ref, e.role, e.name, { frameUrl: frame.url, isField: !!e.isField, isContentEditable: !!e.isContentEditable });
       nd.entry = e;
       while (stack.length && stack[stack.length - 1].depth >= e.depth) stack.pop();
       if (stack.length) stack[stack.length - 1].node.children.push(nd); else roots.push(nd);

@@ -346,6 +346,13 @@
     "radio", "switch", "option", "treeitem", "textbox", "searchbox", "combobox", "textfield",
   ]);
 
+  // Roles that are fields a chat can type into, for find ranking: the
+  // probe-carried isField/isContentEditable facts win where they exist
+  // (framed entries), and the role is the fallback for AX-tree lines,
+  // which carry no facts.
+  const FIELD_ROLES = new Set(["textbox", "searchbox", "combobox", "textfield", "spinbutton"]);
+  const isFieldLine = (l) => !!(l.isField || l.isContentEditable || FIELD_ROLES.has(l.role));
+
   // Rank tree lines for a natural-language query. lines: [{ref, role, name}]
   // Unicode-aware, so queries in any script work.
   function rankForQuery(lines, query) {
@@ -359,7 +366,12 @@
       for (const w of words) if (hay.includes(w)) score += w.length;
       if (score) scored.push([score, l]);
     }
-    scored.sort((a, b) => b[0] - a[0]);
+    // Text score decides first; at an equal score a real field beats
+    // the noise that shares its words (a label's StaticText, a heading,
+    // the Iframe) — a chat hunting the box it must type into should be
+    // handed the box, not its caption. The sort is stable, so order
+    // within a score+field class is the tree order, as before.
+    scored.sort((a, b) => (b[0] - a[0]) || (isFieldLine(b[1]) - isFieldLine(a[1])));
     return scored.slice(0, 20).map((x) => x[1]);
   }
 
@@ -763,7 +775,7 @@
       const btnInput = el.tagName === "INPUT" && ["submit", "button", "reset", "image"].includes(t);
       const field = !btnInput && (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || !!el.isContentEditable);
       const text = pwd || field ? "" : btnInput ? (el.value || attr(el, "alt")) : txt(el);
-      const label = (labelText(el) || attr(el, "aria-label") || attr(el, "placeholder") || attr(el, "name") || attr(el, "title")).slice(0, 120);
+      const label = (labelText(el) || attr(el, "aria-label") || attr(el, "placeholder") || attr(el, "data-placeholder") || attr(el, "name") || attr(el, "title")).slice(0, 120);
       const link = el.closest ? el.closest("a[href]") : null;
       const tag = el.tagName.toLowerCase();
       const role = attr(el, "role").toLowerCase();

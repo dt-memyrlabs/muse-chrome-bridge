@@ -3,6 +3,37 @@
 Release notes for every shipped version, newest first. The same text
 ships on each GitHub release page.
 
+## v2.10.4 — the chat box is findable (2026-11-03)
+
+A chat told Daniel it could not find the chat box to type in. The
+diagnosis run on the real-Chrome rig proved two causes; this build
+fixes both, and nothing else.
+
+- **A box named only by its prompt text now has a name.** Real chat
+  editors (the Slate/Lexical/ProseMirror pattern) name their composer
+  only through `data-placeholder` — the grey prompt text rendered
+  inside the empty box. The page probe's name chain read a label,
+  `aria-label`, a real `placeholder`, `name` and `title`, but never
+  `data-placeholder`, so such a composer entered the tree with no
+  name at all, and `find` by its visible prompt text returned
+  nothing. `data-placeholder` now sits in the chain immediately
+  after the real `placeholder`, and the name flows into the framed
+  tree and `find` results.
+- **Find hands back the field before its caption.** Ranking scored
+  by text match alone, so a label's static text, a heading or the
+  frame itself could tie with — and bury — the real text box (a
+  labelled composer ranked #16 of 20 for "chat box"). Framed tree
+  entries now carry their field/editable facts into find's flat
+  list, and at an equal text score a textbox/field match sorts
+  above non-field matches. Matching itself is unchanged: the same
+  substring scoring, the same 20-result cap, the same result shape.
+
+Proven on the real-Chrome rig with a new case: a framed composer
+stripped of its label and aria-label, carrying only
+`data-placeholder="Write your prompt"`, is the top match for
+`find "write your prompt"` — the only match — and typing through
+its ref lands in the frame, confirmed by the frame's own report.
+
 ## v2.10.3 — one pill only (2026-11-03)
 
 Daniel's order: a shared tab showed TWO pill boxes. Now it shows one.

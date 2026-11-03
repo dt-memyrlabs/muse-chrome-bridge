@@ -65,6 +65,11 @@ def _handler_b():
             if self.path in ("/", "/chat.html"):
                 with open(os.path.join(PAGES, "chat.html"), encoding="utf-8") as f:
                     return self._html(f.read().encode())
+            if self.path == "/chat-dp.html":
+                # The data-placeholder composer page (v2.10.4 find case):
+                # the composer's only name source is data-placeholder.
+                with open(os.path.join(PAGES, "chat-dp.html"), encoding="utf-8") as f:
+                    return self._html(f.read().encode())
             if self.path == "/chat-key.html":
                 # The keydown-submit composer page (v2.10 Enter case):
                 # submits only on a real Enter keydown, and reports the

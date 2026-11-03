@@ -7,8 +7,8 @@
   body { margin: 0; font-family: sans-serif; }
   #control-zone { padding: 12px; }
   #control-input { width: 420px; height: 56px; }
-  #chat-frame, #chat-frame-same, #chat-frame-key { display: block; border: 0; outline: 2px solid #888; width: 780px; height: 470px; margin: 12px; }
-  #mirror, #mirror-same, #mirror-key { white-space: pre-wrap; background: #f4f4f4; padding: 8px; margin: 12px; min-height: 60px; }
+  #chat-frame, #chat-frame-same, #chat-frame-key, #chat-frame-dp { display: block; border: 0; outline: 2px solid #888; width: 780px; height: 470px; margin: 12px; }
+  #mirror, #mirror-same, #mirror-key, #mirror-dp { white-space: pre-wrap; background: #f4f4f4; padding: 8px; margin: 12px; min-height: 60px; }
 </style>
 </head>
 <body>
@@ -34,6 +34,11 @@
 
   <h2>Keydown-submit framed chat state, as reported by the frame itself (postMessage)</h2>
   <pre id="mirror-key">no frame state yet</pre>
+
+  <iframe id="chat-frame-dp" src="__CHAT_ORIGIN__/chat-dp.html" title="data-placeholder framed chat"></iframe>
+
+  <h2>Data-placeholder framed chat state, as reported by the frame itself (postMessage)</h2>
+  <pre id="mirror-dp">no frame state yet</pre>
 
 <script>
   document.getElementById('control-post').addEventListener('click', () => {
@@ -63,6 +68,7 @@
     // reports from this page's own origin. The keydown-submit page also
     // reports from origin B, so it is told apart by its page field.
     const el = d.page === 'key' ? 'mirror-key'
+      : d.page === 'dp' ? 'mirror-dp'
       : (d.origin && d.origin.includes(':8972') ? 'mirror' : 'mirror-same');
     document.getElementById(el).textContent = lines.join('\n');
   });

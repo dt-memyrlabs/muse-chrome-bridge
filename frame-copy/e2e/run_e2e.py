@@ -509,7 +509,7 @@ def main():
                 return r.get("result", {}).get("value")
             return ("isolated world in the child frame", ev)
 
-        frame_kind, frame_eval = wait_for(lambda: build_frame_view(":8972", exclude="chat-key"),
+        frame_kind, frame_eval = wait_for(lambda: build_frame_view(":8972/chat.html", exclude="chat-key"),
                                           20, "a way to read the framed page")
         wait_for(lambda: frame_eval("document.readyState") == "complete",
                  20, "framed chat page load")
@@ -761,6 +761,45 @@ def main():
         log(f"  same-origin frame messages: {truth['messages']}")
         log(f"  => {'PASS' if results['ref-sameorigin-composer'] else 'FAIL'} ref-sameorigin-composer")
 
+        # ==== CASE: find a data-placeholder-only composer (v2.10.4) ======
+        # The live failure this build fixes: a chat "cannot find the chat
+        # box to type in". Real editors (Slate/Lexical/ProseMirror) name
+        # their composer ONLY via data-placeholder; before v2.10.4 the
+        # probe's name chain never read it, so the composer entered the
+        # tree unnamed and find by its visible prompt text returned [].
+        # This frame's composer carries data-placeholder and nothing else
+        # (no label, no aria-label, no placeholder). Verdict: find by the
+        # placeholder's own words must return the framed textbox as the
+        # TOP match, and typing through its ref must land in the frame —
+        # proven by the frame's own postMessage ground truth.
+        log("\nCASE find-data-placeholder: find the framed composer by its data-placeholder text, click its ref, type")
+        TEXT_DP = "lima-dataplaceholder-888"
+        rc, out = client(chatdir, "find", json.dumps({"tabId": tab_id, "query": "write your prompt"}))
+        dp_matches = (out.get("data") or {}).get("matches", [])
+        log(f"  find \"write your prompt\" -> {json.dumps(dp_matches)}")
+        top = dp_matches[0] if dp_matches else {}
+        top_ok = (top.get("role") == "textbox" and top.get("name") == "Write your prompt"
+                  and (top.get("frame") or "").endswith("/chat-dp.html"))
+        log(f"  top match is the framed data-placeholder textbox: {top_ok} (top={json.dumps(top)})")
+        typed_ok = False
+        if top.get("ref"):
+            cdp.evaluate(parent, "document.getElementById('chat-frame-dp').scrollIntoView()")
+            time.sleep(0.4)
+            client(chatdir, "computer", json.dumps(
+                {"action": "left_click", "tabId": tab_id, "ref": top["ref"]}))
+            type_text(tab_id, TEXT_DP)
+            time.sleep(0.6)
+            mirror_dp = cdp.evaluate(parent, "document.getElementById('mirror-dp').textContent")
+            log(f"  frame ground truth, as reported by the dp frame itself (mirror-dp): {mirror_dp!r}")
+            typed_ok = ("COMPOSER: " + TEXT_DP) in mirror_dp
+            shot_parent("v2104-find-dp.png")
+            log("  screenshot saved: v2104-find-dp.png (parent page: the found data-placeholder composer, typed)")
+            cdp.evaluate(parent, "window.scrollTo(0, 0)")
+            time.sleep(0.3)
+        results["find-data-placeholder"] = bool(top_ok and typed_ok)
+        log(f"  top match is the framed textbox named by its data-placeholder: {top_ok}; typed text in the frame's own ground truth: {typed_ok}")
+        log(f"  => {'PASS' if results['find-data-placeholder'] else 'FAIL'} find-data-placeholder")
+
         # ==== CASE 8: keydown-submit composer (v2.10, the 8090 failure) ====
         # factory.8090.ai, 2026-11-02: a chat typed into the framed
         # composer through the bridge; the text landed, but Enter,
@@ -902,7 +941,7 @@ def main():
         tok_val = open(tok_path).read().strip() if os.path.isfile(tok_path) else ""
         r = panel.send("debug_report", {"tabId": tab_id, "ua": "rig-check", "check": steps})
         text = (r or {}).get("text") or ""
-        has_bits = all(x in text for x in ("2.10.3", "Frame Rig", "frame-a.test", "PASS Relay reachable", "Recent activity"))
+        has_bits = all(x in text for x in ("2.10.4", "Frame Rig", "frame-a.test", "PASS Relay reachable", "Recent activity"))
         leaks = [x for x in (tok_val, SECRET) if x and x in text]
         results["debug-report"] = bool(r and r.get("ok") and has_bits and not leaks)
         log(f"  report has version/chat/host/check/events: {has_bits}; leaks token or enroll secret: {leaks}")
@@ -1043,7 +1082,7 @@ def main():
     log("\n==== SUMMARY ====")
     for name in ("generation-confirmation", "single-pill", "framed-contenteditable", "framed-textarea", "parent-control",
                  "ref-cross-composer", "ref-framed-textarea", "ref-sameorigin-composer",
-                 "framed-enter-submit", "background-framed-composer",
+                 "find-data-placeholder", "framed-enter-submit", "background-framed-composer",
                  "check-connection", "debug-report", "refresh-live", "refresh-dead-token",
                  "check-connection-relay-down"):
         if name in results:
