@@ -3,6 +3,32 @@
 Release notes for every shipped version, newest first. The same text
 ships on each GitHub release page.
 
+## v2.10.2 — panel results that match the state they're in (2026-11-02)
+
+Five panel fixes from the v2.10.1 review gate. Panel-side only: no
+behavior changes outside the side panel, and the generation
+confirmation, refresh revival, check steps, debug report contents and
+helper lines are exactly as v2.10.1 shipped them.
+
+- **Check results clear when the share state changes.** Results belong
+  to the state they were run in: moving between unshared, waiting on a
+  code, and shared — or the controlling chat changing — drops the old
+  results, so a connected panel can no longer show an unshared run's
+  red "this tab is not shared with any chat" under a "Shared with …"
+  header.
+- **Steps that never ran read as neutral.** A "not checked" step now
+  renders muted with a – mark, distinct from a ✓ pass and a ✗ fail,
+  instead of wearing the red failure glyph.
+- **Exit verbs say their scope.** The chat-level button reads
+  "Disconnect chat"; the × on a tab row carries the title "Stop
+  sharing this tab". Words only — no behavior changed.
+- **The code state counts down live.** "Expires in about 5 min" is now
+  a ticking "Expires in 4:32", driven by the code's real expiry, in
+  the same style as the confirmation card's countdown.
+- **Connection buttons keep their labels on one line.** The button row
+  wraps whole buttons instead of squeezing each label onto two lines,
+  in both the shared and unshared states.
+
 ## v2.10.1 — the Connection area, placed right (2026-11-02)
 
 Four panel fixes from the v2.10.0 review gate. Nothing else changed:

@@ -64,6 +64,21 @@ function disableAll() { for (const c of cards.values()) arm(c); }
 const copied = {}; // reqId -> note shown under a code (the fallback flow)
 let lastCheck = null; // {tabId, steps} — the last Check connection result, this panel only
 let lastConnNote = ""; // note under the Connection buttons (e.g. "Copied.")
+/* Check results belong to the share state they were run in (v2.10.2).
+ * The signature below names the current tab's state — unshared,
+ * waiting on a code, or shared with a named chat. When it changes, the
+ * stored results are dropped, so a connected panel can never show an
+ * unshared run's "this tab is not shared with any chat" under a
+ * "Shared with …" header. */
+let lastStateSig = null;
+let codeExpiryEl = null; // the code state's "Expires in m:ss" line, ticked by refresh()
+function fmtLeft(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+function codeExpiryText(st) {
+  return "Works once. Expires in " + fmtLeft(st.share.expires - Date.now()) + ". Not connected until the chat uses it.";
+}
 // The panel is code-first; there is no More options toggle.
 
 function copyText(text) {
@@ -127,14 +142,19 @@ function buildConnection(c, shared) {
     } else lastConnNote = "Could not build the report: " + ((r && (r.detail || r.error)) || "no answer");
     lastJson = ""; refresh();
   });
-  conn.append(el("div", { class: "row" }, ...rowKids));
+  conn.append(el("div", { class: "row conn-row" }, ...rowKids));
   if (refrErr) conn.append(refrErr);
   conn.append(note);
   if (lastCheck && lastCheck.tabId === c.tabId) {
     const list = el("div", { class: "steps" });
     for (const stp of lastCheck.steps) {
-      list.append(el("div", { class: stp.ok ? "step-ok" : "step-fail" },
-        (stp.ok ? "\u2713 " : "\u2717 ") + stp.name + (stp.detail ? " — " + stp.detail : "")));
+      // A step that never ran ("not checked — …") is neutral, not a
+      // failure: muted, with an en dash instead of the red ✗ (v2.10.2).
+      const skipped = !stp.ok && /^not checked/.test(stp.detail || "");
+      const cls = stp.ok ? "step-ok" : skipped ? "step-skip" : "step-fail";
+      const mark = stp.ok ? "\u2713 " : skipped ? "\u2013 " : "\u2717 ";
+      list.append(el("div", { class: cls },
+        mark + stp.name + (stp.detail ? " — " + stp.detail : "")));
     }
     conn.append(list);
   }
@@ -147,6 +167,18 @@ async function refresh() {
   try { st = await send("state", myWindowId === null ? undefined : { windowId: myWindowId }); } catch (e) { return; }
   if (!st || !st.ok) return;
   renderPrompts(st.prompts);
+  // Share-state signature: a change clears the stored check results
+  // (they belong to the state they were run in) — checked before the
+  // render dedupe below, like the prompt countdowns above.
+  const sig = !st.current ? "none"
+    : st.current.tabId + "|" + (st.current.sharedWith || (st.share ? "waiting" : "unshared"));
+  if (lastStateSig !== null && sig !== lastStateSig) lastCheck = null;
+  lastStateSig = sig;
+  // The code state's expiry line ticks every second, in the same style
+  // as the confirmation card's countdown; the render below is deduped,
+  // so the live element is updated in place here.
+  if (codeExpiryEl && !(st.share && st.share.code)) codeExpiryEl = null;
+  if (codeExpiryEl) codeExpiryEl.textContent = codeExpiryText(st);
   if (st.share && st.share.code && !copied[st.share.reqId]) {
     copied[st.share.reqId] = "Copying…";
     copyText(st.share.code).then(() => { copied[st.share.reqId] = "Copied. Paste it into the Muse chat."; },
@@ -190,7 +222,7 @@ async function refresh() {
         : "Waiting for your answer to the confirmation above. The code appears here after you tap Allow — the chat gets the tab with no more questions."),
       el("div", { class: "row" }, cancel()));
   } else if (st.share && st.share.code) {
-    const mins = Math.max(0, Math.round((st.share.expires - Date.now()) / 60000));
+    codeExpiryEl = el("p", { class: "muted" }, codeExpiryText(st));
     pg.append(
       el("div", { class: "site" }, c.host),
       el("p", { class: "muted" }, c.sharedWith
@@ -199,7 +231,7 @@ async function refresh() {
       el("div", { class: "code" }, st.share.code.slice(0, 4) + "-" + st.share.code.slice(4)),
       el("p", { class: "copied" }, copied[st.share.reqId] || ""),
       el("p", { class: "muted" }, "You already confirmed, when you generated this code, that the chat you give it to gets full control of this tab. It connects with no more questions. Stop sharing to end it."),
-      el("p", { class: "muted" }, `Works once. Expires in about ${mins} min. Not connected until the chat uses it.`),
+      codeExpiryEl,
       el("div", { class: "row" },
         el("button", { onclick: () => copyText(st.share.code).then(() => { copied[st.share.reqId] = "Copied. Paste it into the Muse chat."; lastJson = ""; refresh(); }, () => {}) }, "Copy"),
         cancel()));
@@ -251,12 +283,12 @@ async function refresh() {
 // pointer) must never end a chat, so a second, deliberate click is required
 // to confirm the disconnect.
 function disconnectButton(x) {
-  const b = el("button", { class: "danger" }, "Disconnect");
+  const b = el("button", { class: "danger" }, "Disconnect chat");
   let armed = null;
   b.addEventListener("click", () => {
     if (!armed) {
       b.textContent = "Click again to end this chat";
-      armed = setTimeout(() => { armed = null; b.textContent = "Disconnect"; }, 4000);
+      armed = setTimeout(() => { armed = null; b.textContent = "Disconnect chat"; }, 4000);
       return;
     }
     clearTimeout(armed); armed = null; b.disabled = true;
@@ -342,7 +374,7 @@ function renderRest(st) {
         const rm = el("button", { class: "site-remove", onclick: () => { const r = send("revoke_site", { sessionId: x.sessionId, host }); if (r && r.then) r.then(() => { lastJson = ""; refresh(); }); } }, "×");
         rm.setAttribute("aria-label", "Remove " + host);
         rm.setAttribute("data-host", host);
-        rm.title = "Remove " + host;
+        rm.title = "Stop sharing this tab";
         list.append(el("div", { class: "site-row" }, el("span", { class: "site-name" }, host), rm));
       }
       block.append(list);
@@ -361,7 +393,7 @@ function renderRest(st) {
 chrome.runtime.onMessage.addListener((m) => { if (m && m.kind === "changed") refresh(); });
 chrome.tabs.onActivated.addListener((info) => { if (myWindowId !== null && info && info.windowId !== myWindowId) return; lastJson = ""; refresh(); });
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => { if (myWindowId !== null && tab && tab.windowId !== myWindowId) return; refresh(); });
-setInterval(() => refresh(), 1000); // countdowns; the page section redraws only when its data changes
-setInterval(() => { lastJson = ""; }, 30000); // the code's "expires in" minutes
+setInterval(() => refresh(), 1000); // countdowns (card + code expiry); the page section redraws only when its data changes
+setInterval(() => { lastJson = ""; }, 30000); // periodic full redraw
 refresh();
 

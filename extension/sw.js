@@ -22,7 +22,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.10.1";
+const VERSION = "2.10.2";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left

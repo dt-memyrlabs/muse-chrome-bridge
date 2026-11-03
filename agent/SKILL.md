@@ -1,4 +1,4 @@
-# muse-browser-bridge (v2.10.1)
+# muse-browser-bridge (v2.10.2)
 
 Independent open-source project that works with Muse chats. It is not a Meta or Anthropic product, and it is not affiliated with or endorsed by Meta or Anthropic.
 
