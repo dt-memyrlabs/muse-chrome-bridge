@@ -3,6 +3,31 @@
 Release notes for every shipped version, newest first. The same text
 ships on each GitHub release page.
 
+## v2.10.1 — the Connection area, placed right (2026-11-02)
+
+Four panel fixes from the v2.10.0 review gate. Nothing else changed:
+no behavior changes outside the side panel, and the generation
+confirmation, refresh revival, check steps and debug report contents
+are exactly as v2.10.0 shipped them.
+
+- **Refresh connection moved into the Connection area**, alongside
+  Check connection and Copy debug report. The This tab block now holds
+  only "Stop sharing this tab".
+- **The Connection area now shows in the unshared state too**, with
+  Check connection and Copy debug report (no Refresh — nothing to
+  refresh before pairing). Check connection runs unpaired: it reports
+  whether the relay is reachable, and the session steps read as not
+  applicable until the tab is shared. The debug report copies unpaired
+  — the machine that cannot pair is the one that needs the report.
+- **The "Connection" label** now uses the same small uppercase
+  letter-spaced gray section-label style as THIS TAB and YOUR CHATS,
+  with the same spacing.
+- **A recovery line** under the Connection label states the sequence
+  in plain words. Shared: "Connection broken? Run Check connection
+  first. If it fails, use Refresh connection and paste the new code
+  into the chat." Unshared: "Can't connect? Run Check connection, or
+  copy a debug report and send it to the chat."
+
 ## v2.10.0 — the panel, stripped back; connections that revive (2026-11-02)
 
 The side panel returns to the code-first minimum, and a shared tab gains

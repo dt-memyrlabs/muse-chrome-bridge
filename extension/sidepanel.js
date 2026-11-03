@@ -76,6 +76,71 @@ function copyText(text) {
   });
 }
 
+/* The Connection area (v2.10; layout fixed v2.10.1): one small area in
+ * the This tab section, present in BOTH the shared and the unshared
+ * state. Shared: Check connection, Refresh connection, Copy debug
+ * report. Unshared: Check connection and Copy debug report only —
+ * nothing to refresh before pairing, and the machine that cannot pair
+ * is exactly the one that needs the check and the report. The label is
+ * a real <h2>, so it carries the same section-label style and the same
+ * label-to-content spacing as THIS TAB and YOUR CHATS. The helper line
+ * under the label states the recovery sequence for the state. */
+function buildConnection(c, shared) {
+  const conn = el("div", { class: "conn" });
+  conn.append(el("h2", {}, "Connection"));
+  conn.append(el("p", { class: "muted" }, shared
+    ? "Connection broken? Run Check connection first. If it fails, use Refresh connection and paste the new code into the chat."
+    : "Can't connect? Run Check connection, or copy a debug report and send it to the chat."));
+  const checkBtn = el("button", {}, "Check connection");
+  const copyBtn = el("button", {}, "Copy debug report");
+  const note = el("p", { class: "muted" }, lastConnNote);
+  const rowKids = [checkBtn];
+  let refrErr = null;
+  if (shared) {
+    const refr = el("button", {}, "Refresh connection");
+    refrErr = el("p", { class: "muted" });
+    refr.addEventListener("click", async () => {
+      refr.disabled = true;
+      const r = await send("share", { tabId: c.tabId });
+      if (!r || !r.ok) { refrErr.textContent = "Couldn't: " + ((r && (r.detail || r.error)) || "error"); refr.disabled = false; return; }
+      lastJson = ""; refresh();
+    });
+    rowKids.push(refr);
+  }
+  rowKids.push(copyBtn);
+  checkBtn.addEventListener("click", async () => {
+    checkBtn.disabled = true; checkBtn.textContent = "Checking\u2026";
+    const r = await send("check_connection", { tabId: c.tabId });
+    checkBtn.disabled = false; checkBtn.textContent = "Check connection";
+    lastCheck = (r && r.ok && Array.isArray(r.steps)) ? { tabId: c.tabId, steps: r.steps }
+      : { tabId: c.tabId, steps: [{ name: "Check connection", ok: false, detail: (r && (r.detail || r.error)) || "the extension did not answer" }] };
+    lastJson = ""; refresh();
+  });
+  copyBtn.addEventListener("click", async () => {
+    copyBtn.disabled = true;
+    const r = await send("debug_report", { tabId: c.tabId, ua: navigator.userAgent,
+      check: (lastCheck && lastCheck.tabId === c.tabId) ? lastCheck.steps : [] });
+    copyBtn.disabled = false;
+    if (r && r.ok && r.text) {
+      try { await copyText(r.text); lastConnNote = "Copied. Paste it into any Muse chat."; }
+      catch (e) { lastConnNote = "Copy failed — the browser refused clipboard access."; }
+    } else lastConnNote = "Could not build the report: " + ((r && (r.detail || r.error)) || "no answer");
+    lastJson = ""; refresh();
+  });
+  conn.append(el("div", { class: "row" }, ...rowKids));
+  if (refrErr) conn.append(refrErr);
+  conn.append(note);
+  if (lastCheck && lastCheck.tabId === c.tabId) {
+    const list = el("div", { class: "steps" });
+    for (const stp of lastCheck.steps) {
+      list.append(el("div", { class: stp.ok ? "step-ok" : "step-fail" },
+        (stp.ok ? "\u2713 " : "\u2717 ") + stp.name + (stp.detail ? " — " + stp.detail : "")));
+    }
+    conn.append(list);
+  }
+  return conn;
+}
+
 let lastJson = "";
 async function refresh() {
   let st;
@@ -141,56 +206,13 @@ async function refresh() {
   } else if (c.sharedWith) {
     const stop = el("button", {}, "Stop sharing this tab");
     stop.addEventListener("click", async () => { stop.disabled = true; await send("remove_tab", { tabId: c.tabId }); again(); });
-    const refr = el("button", {}, "Refresh connection");
-    const refrErr = el("p", { class: "muted" });
-    refr.addEventListener("click", async () => {
-      refr.disabled = true;
-      const r = await send("share", { tabId: c.tabId });
-      if (!r || !r.ok) { refrErr.textContent = "Couldn't: " + ((r && (r.detail || r.error)) || "error"); refr.disabled = false; return; }
-      again();
-    });
     pg.append(el("div", { class: "site" }, c.host), el("p", { class: "muted" }, "Shared with " + c.sharedWith + "."),
-      el("div", { class: "row" }, stop, refr), refrErr);
+      el("div", { class: "row" }, stop));
     if (st.share) {
       pg.append(el("p", { class: "muted" }, st.share.stalled ? "No code came back from the relay. Cancel and try again." : "Getting a fresh code\u2026"),
         el("div", { class: "row" }, cancel()));
     }
-    // Connection area (v2.10): check the link end to end, or copy a
-    // debug report to paste into any chat. Nothing else lives here.
-    const conn = el("div", { class: "conn" });
-    conn.append(el("p", { class: "muted" }, "Connection"));
-    const checkBtn = el("button", {}, "Check connection");
-    const copyBtn = el("button", {}, "Copy debug report");
-    const note = el("p", { class: "muted" }, lastConnNote);
-    checkBtn.addEventListener("click", async () => {
-      checkBtn.disabled = true; checkBtn.textContent = "Checking\u2026";
-      const r = await send("check_connection", { tabId: c.tabId });
-      checkBtn.disabled = false; checkBtn.textContent = "Check connection";
-      lastCheck = (r && r.ok && Array.isArray(r.steps)) ? { tabId: c.tabId, steps: r.steps }
-        : { tabId: c.tabId, steps: [{ name: "Check connection", ok: false, detail: (r && (r.detail || r.error)) || "the extension did not answer" }] };
-      lastJson = ""; refresh();
-    });
-    copyBtn.addEventListener("click", async () => {
-      copyBtn.disabled = true;
-      const r = await send("debug_report", { tabId: c.tabId, ua: navigator.userAgent,
-        check: (lastCheck && lastCheck.tabId === c.tabId) ? lastCheck.steps : [] });
-      copyBtn.disabled = false;
-      if (r && r.ok && r.text) {
-        try { await copyText(r.text); lastConnNote = "Copied. Paste it into any Muse chat."; }
-        catch (e) { lastConnNote = "Copy failed — the browser refused clipboard access."; }
-      } else lastConnNote = "Could not build the report: " + ((r && (r.detail || r.error)) || "no answer");
-      lastJson = ""; refresh();
-    });
-    conn.append(el("div", { class: "row" }, checkBtn, copyBtn), note);
-    if (lastCheck && lastCheck.tabId === c.tabId) {
-      const list = el("div", { class: "steps" });
-      for (const stp of lastCheck.steps) {
-        list.append(el("div", { class: stp.ok ? "step-ok" : "step-fail" },
-          (stp.ok ? "\u2713 " : "\u2717 ") + stp.name + (stp.detail ? " — " + stp.detail : "")));
-      }
-      conn.append(list);
-    }
-    pg.append(conn);
+    pg.append(buildConnection(c, true));
   } else if (!c.shareable) {
     pg.append(el("p", { class: "empty" }, "This page can't be shared (only http and https pages)."));
   } else if (st.share) {
@@ -219,7 +241,7 @@ async function refresh() {
     });
     pg.append(el("div", { class: "site" }, c.host), el("p", { class: "muted" }, c.title || ""),
       el("p", { class: "muted" }, "Not shared. Generate a code and paste it into the Muse chat that should control this tab."),
-      el("div", { class: "row" }, gen), err);
+      el("div", { class: "row" }, gen), err, buildConnection(c, false));
   }
   renderRest(st);
 }
