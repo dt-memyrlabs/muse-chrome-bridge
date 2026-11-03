@@ -337,6 +337,23 @@ class Relay:
                     self._settle_pair_ack(msg.get("sessionId"), False, msg.get("error"))
                 elif t == "heartbeat":
                     pass
+                elif t == "session_check":
+                    # The panel's Check connection asks the relay — the
+                    # side that owns the token registry — whether this
+                    # device's session is still live here. A session the
+                    # relay has forgotten (expired, revoked, state lost)
+                    # answers live: false; the extension's own copy of the
+                    # session is never taken as proof.
+                    sid = msg.get("sessionId")
+                    live = False
+                    if isinstance(sid, str) and sid:
+                        with self.state.lock:
+                            s = self.state.sessions.get(sid)
+                            live = bool(s) and s.get("deviceId") == device_id \
+                                and not self.state.is_expired(s)
+                    await ws.send(json.dumps({"t": "session_check_result",
+                                              "id": msg.get("id"),
+                                              "sessionId": sid, "live": live}))
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:

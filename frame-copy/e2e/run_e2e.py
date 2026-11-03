@@ -406,10 +406,12 @@ def main():
         # generated code then asks nothing.
         pump = PromptPump(panel, window_id)
         pump.start()
+        generations = {"n": 0}  # code generations started by the rig
         log("panel prompt pump running (auto-approves panel cards, logging each)")
 
         cdp.call("Target.activateTarget", {"targetId": parent_target})
         r = panel.send("share", {"tabId": tab_id})
+        generations["n"] += 1
         log(f"share requested: {r}")
         if not r.get("ok"):
             raise RuntimeError(f"share failed: {r}")
@@ -476,16 +478,18 @@ def main():
         # an isolated world created in the child frame on the page session.
         # Either way this is harness instrumentation only — the bridge is
         # driven solely through client.py.
-        def build_frame_view():
+        def build_frame_view(url_part, exclude=None):
+            def wanted(u):
+                return url_part in (u or "") and not (exclude and exclude in (u or ""))
             for t in cdp.targets():
-                if t["type"] == "iframe" and ":8972" in t.get("url", ""):
+                if t["type"] == "iframe" and wanted(t.get("url", "")):
                     sess = cdp.attach(t["targetId"])
                     return ("oopif target", lambda expr: cdp.evaluate(sess, expr))
             tree = cdp.call("Page.getFrameTree", {}, parent)["frameTree"]
             child, stack = None, [tree]
             while stack:
                 node = stack.pop()
-                if ":8972" in node["frame"].get("url", ""):
+                if wanted(node["frame"].get("url", "")):
                     child = node["frame"]
                     break
                 stack.extend(node.get("childFrames", []))
@@ -504,7 +508,8 @@ def main():
                 return r.get("result", {}).get("value")
             return ("isolated world in the child frame", ev)
 
-        frame_kind, frame_eval = wait_for(build_frame_view, 20, "a way to read the framed page")
+        frame_kind, frame_eval = wait_for(lambda: build_frame_view(":8972", exclude="chat-key"),
+                                          20, "a way to read the framed page")
         wait_for(lambda: frame_eval("document.readyState") == "complete",
                  20, "framed chat page load")
         log(f"harness reads the framed page via: {frame_kind}")
@@ -687,6 +692,75 @@ def main():
         log(f"  same-origin frame messages: {truth['messages']}")
         log(f"  => {'PASS' if results['ref-sameorigin-composer'] else 'FAIL'} ref-sameorigin-composer")
 
+        # ==== CASE 8: keydown-submit composer (v2.10, the 8090 failure) ====
+        # factory.8090.ai, 2026-11-02: a chat typed into the framed
+        # composer through the bridge; the text landed, but Enter,
+        # Ctrl+Enter and Tab+Space never submitted it. This page submits
+        # ONLY on a real Enter keydown and records every keydown and
+        # beforeinput it receives, so the verdict rests on what the
+        # frame itself saw.
+        log("\nCASE framed-enter-submit: type into the keydown-submit composer, press Enter through the bridge")
+        key_view = wait_for(lambda: build_frame_view("chat-key.html"), 20, "a way to read the key page")
+        key_kind, key_eval = key_view
+        wait_for(lambda: key_eval("document.readyState") == "complete", 20, "key page load")
+        log(f"  harness reads the key page via: {key_kind}")
+        cdp.evaluate(parent, "document.getElementById('chat-frame-key').scrollIntoView()")
+        time.sleep(0.4)
+        key_iframe_rect = rect_in(parent_eval, "chat-frame-key")
+        log(f"  key iframe rect in parent viewport: {key_iframe_rect}")
+
+        def key_framed_point(el_id):
+            r = rect_in(key_eval, el_id)
+            return [round(key_iframe_rect["x"] + r["x"] + r["w"] / 2),
+                    round(key_iframe_rect["y"] + r["y"] + r["h"] / 2)]
+
+        def key_truth():
+            raw = cdp.evaluate(parent, "document.getElementById('mirror-key').textContent")
+            out = {"messages": [], "composer": None, "keydowns": None, "lastkey": ""}
+            for line in raw.splitlines():
+                if line.startswith("MSG: "):
+                    out["messages"].append(line[5:])
+                elif line.startswith("COMPOSER: "):
+                    out["composer"] = line[len("COMPOSER: "):]
+                elif line.startswith("KEYDOWNS: "):
+                    out["keydowns"] = int(line[len("KEYDOWNS: "):] or 0)
+                elif line.startswith("LASTKEY: "):
+                    out["lastkey"] = line[len("LASTKEY: "):]
+            return out
+
+        TEXT_KEY = "hotel-enter-444"
+        TEXT_KEY2 = "india-sendbtn-555"
+        pt = key_framed_point("composer")
+        log(f"  key composer viewport point: {pt}")
+        click(tab_id, pt)
+        type_text(tab_id, TEXT_KEY)
+        time.sleep(0.6)
+        mid = key_truth()
+        log(f"  key page truth after typing: {mid}")
+        typed_ok = mid["composer"] == TEXT_KEY and mid["messages"] == []
+        rc, out = client(chatdir, "computer", json.dumps(
+            {"action": "key", "tabId": tab_id, "text": "Enter"}))
+        log(f"  computer key Enter -> {out.get('ok')}")
+        time.sleep(0.8)
+        truth = key_truth()
+        log(f"  key page truth after Enter: {truth}")
+        enter_ok = truth["messages"] == [TEXT_KEY] and truth["lastkey"].startswith("Enter")
+        pt = key_framed_point("composer")
+        click(tab_id, pt)
+        type_text(tab_id, TEXT_KEY2)
+        time.sleep(0.6)
+        pt = key_framed_point("send-btn")
+        click(tab_id, pt)
+        time.sleep(0.8)
+        truth2 = key_truth()
+        log(f"  key page truth after Send click: {truth2}")
+        send_ok = truth2["messages"] == [TEXT_KEY, TEXT_KEY2]
+        results["framed-enter-submit"] = bool(typed_ok and enter_ok and send_ok)
+        log(f"  typed without submitting: {typed_ok}; Enter submitted with a real Enter keydown seen by the frame: {enter_ok}; Send button click submitted: {send_ok}")
+        log(f"  => {'PASS' if results['framed-enter-submit'] else 'FAIL'} framed-enter-submit")
+        cdp.evaluate(parent, "window.scrollTo(0, 0)")
+        time.sleep(0.3)
+
         # ==== CASE 4: same framed flow, shared tab in the BACKGROUND ========
         # v2.5.0 holds focus emulation for the whole debugger session;
         # v2.4.1 emulated focus only around individual calls. A shared tab
@@ -744,6 +818,123 @@ def main():
         cdp.call("Target.closeTarget", {"targetId": decoy_target})
         time.sleep(0.5)
 
+        # ==== CASE: Check connection (v2.10 Connection area) ==============
+        log("\nCASE check-connection: the panel probe runs every step for this tab")
+        r = panel.send("check_connection", {"tabId": tab_id})
+        steps = (r or {}).get("steps") or []
+        for stp in steps:
+            log(f"  step {'PASS' if stp.get('ok') else 'FAIL'} {stp.get('name')} -- {stp.get('detail')}")
+        results["check-connection"] = bool(r and r.get("ok") and len(steps) == 4 and all(x.get("ok") for x in steps))
+        log(f"  => {'PASS' if results['check-connection'] else 'FAIL'} check-connection")
+
+        # ==== CASE: Copy debug report contents (v2.10) ====================
+        log("\nCASE debug-report: contents complete, and free of secrets")
+        tok_path = os.path.join(chatdir, ".muse-bridge-token")
+        tok_val = open(tok_path).read().strip() if os.path.isfile(tok_path) else ""
+        r = panel.send("debug_report", {"tabId": tab_id, "ua": "rig-check", "check": steps})
+        text = (r or {}).get("text") or ""
+        has_bits = all(x in text for x in ("2.10.0", "Frame Rig", "frame-a.test", "PASS Relay reachable", "Recent activity"))
+        leaks = [x for x in (tok_val, SECRET) if x and x in text]
+        results["debug-report"] = bool(r and r.get("ok") and has_bits and not leaks)
+        log(f"  report has version/chat/host/check/events: {has_bits}; leaks token or enroll secret: {leaks}")
+        log(f"  => {'PASS' if results['debug-report'] else 'FAIL'} debug-report")
+
+        # ==== CASE: Refresh connection, live token (case a) ===============
+        log("\nCASE refresh-live: Refresh on the shared tab, redeem with the live token, control unchanged")
+        def refresh_code():
+            rr = panel.send("share", {"tabId": tab_id})
+            if not rr.get("ok"):
+                raise RuntimeError(f"refresh share failed: {rr}")
+            generations["n"] += 1
+            return wait_for(read_code, 30, "refresh pairing code from the panel state")
+        code2 = refresh_code()
+        log(f"  refresh code obtained: {code2}")
+        rc, out = client(chatdir, "pair", code2, "--chat", CHAT_NAME)
+        tok_after = open(tok_path).read().strip() if os.path.isfile(tok_path) else ""
+        attached_ok = bool(out.get("ok") and out.get("attached") is True)
+        token_same = tok_after == tok_val and bool(tok_val)
+        log(f"  pair with live token -> attached: {attached_ok}; token file unchanged: {token_same}")
+        cdp.evaluate(parent, "window.scrollTo(0, 0)")
+        time.sleep(0.3)
+        iframe_rect = rect_in(parent_eval, "chat-frame")
+        pt = framed_point("composer")
+        click(tab_id, pt)
+        type_text(tab_id, "juliett-refresh-666")
+        time.sleep(0.6)
+        pt = framed_point("send-btn")
+        click(tab_id, pt)
+        time.sleep(0.8)
+        truth = frame_truth()
+        ctrl_ok = "juliett-refresh-666" in truth["messages"]
+        log(f"  control after refresh (typed + sent in the framed composer): {ctrl_ok}; messages: {truth['messages']}")
+        results["refresh-live"] = bool(attached_ok and token_same and ctrl_ok)
+        log(f"  => {'PASS' if results['refresh-live'] else 'FAIL'} refresh-live")
+
+        # ==== CASE: Refresh connection, DEAD token (case b) ===============
+        # A second chat folder whose saved token the relay has never
+        # known: every call answers bad_token. A Refresh code from the
+        # panel must revive it: fresh session, dead token file replaced,
+        # the tab's control moves to the revived chat.
+        log("\nCASE refresh-dead-token: a chat with a dead token is revived by a Refresh code")
+        chatdir2 = os.path.join(tmp, "chat2")
+        os.makedirs(chatdir2)
+        tok2_path = os.path.join(chatdir2, ".muse-bridge-token")
+        dead_tok = "dead-token-" + "0" * 40
+        with open(tok2_path, "w") as f:
+            f.write(dead_tok)
+        rc, out = client(chatdir2, "status", timeout=30)
+        dead_ok = out.get("error") == "bad_token"
+        log(f"  dead token status -> {out.get('error')!r} (bad_token expected): {dead_ok}")
+        code3 = refresh_code()
+        rc, out = client(chatdir2, "pair", code3, "--chat", "Frame Rig B")
+        tok2_after = open(tok2_path).read().strip() if os.path.isfile(tok2_path) else ""
+        replaced_ok = bool(out.get("ok")) and tok2_after not in ("", dead_tok)
+        log(f"  pair with the refresh code -> ok: {out.get('ok')}; dead token replaced in the file: {replaced_ok}")
+        rc, out_b = client(chatdir2, "tabs_context", "{}")
+        b_has = bool((out_b.get("data") or {}).get("tabs")) and any(
+            t.get("tabId") == tab_id for t in out_b["data"]["tabs"])
+        rc, out_a = client(chatdir, "tabs_context", "{}")
+        a_has = any(t.get("tabId") == tab_id for t in (out_a.get("data") or {}).get("tabs", []))
+        log(f"  revived chat sees the tab: {b_has}; the old chat no longer holds it: {not a_has}")
+        pt = framed_point("composer")
+        rc, out_b = client(chatdir2, "computer", json.dumps(
+            {"action": "left_click", "tabId": tab_id, "coordinate": pt}))
+        rc, out_b = client(chatdir2, "computer", json.dumps(
+            {"action": "type", "tabId": tab_id, "text": "kilo-revived-777"}))
+        time.sleep(0.6)
+        pt = framed_point("send-btn")
+        rc, out_b = client(chatdir2, "computer", json.dumps(
+            {"action": "left_click", "tabId": tab_id, "coordinate": pt}))
+        time.sleep(0.8)
+        truth = frame_truth()
+        revived_ok = "kilo-revived-777" in truth["messages"]
+        log(f"  revived chat drove the framed composer (typed + sent): {revived_ok}; messages: {truth['messages']}")
+        results["refresh-dead-token"] = bool(dead_ok and replaced_ok and b_has and not a_has and revived_ok)
+        log(f"  => {'PASS' if results['refresh-dead-token'] else 'FAIL'} refresh-dead-token")
+
+        # ==== CASE: Check connection with the relay DOWN ==================
+        # Forced failure, run last: every step must report its real
+        # result — the relay step fails with the reason, the rest fail
+        # as not checked. Nothing may pass silently.
+        log("\nCASE check-connection-relay-down: forced failure reports real results")
+        relay.terminate()
+        try:
+            relay.wait(timeout=10)
+        except Exception:
+            relay.kill()
+        def relay_down_state():
+            stt = panel.send("state", {"windowId": window_id})
+            return stt if not (stt or {}).get("relay", {}).get("connected") else None
+        wait_for(relay_down_state, 30, "extension to notice the relay is down")
+        r = panel.send("check_connection", {"tabId": tab_id})
+        steps = (r or {}).get("steps") or []
+        for stp in steps:
+            log(f"  step {'PASS' if stp.get('ok') else 'FAIL'} {stp.get('name')} -- {stp.get('detail')}")
+        results["check-connection-relay-down"] = bool(
+            len(steps) == 4 and steps[0].get("ok") is False and steps[0].get("detail")
+            and all(x.get("ok") is False for x in steps))
+        log(f"  => {'PASS' if results['check-connection-relay-down'] else 'FAIL'} check-connection-relay-down")
+
     except Exception as e:  # noqa: BLE001 - rig setup failure
         import traceback
         log(f"RIG ERROR: {e}")
@@ -768,16 +959,24 @@ def main():
         else:
             log(f"--keep: chromium + relay left running; state in {tmp}")
 
-    # Whole-run one-card rule (v2.9): no later action may have raised a
-    # card either — the pump's total for the entire run must stay 1.
-    if pump and len(pump.approved) != 1:
-        results["generation-confirmation"] = False
-        log(f"one-card evidence FAILED for the whole run: {len(pump.approved)} cards approved in total")
+    # Whole-run card rule (v2.9, extended v2.10): exactly one card per
+    # code generation the rig started (initial share + each Refresh),
+    # each approved BEFORE its code existed, and no card at any
+    # redemption — including the refresh redemptions.
+    if pump:
+        want = generations["n"] if "generations" in dir() else 1
+        cards_ok = len(pump.approved) == want and all(not p.get("_codeAtApproval") for p in pump.approved)
+        if not cards_ok:
+            results["generation-confirmation"] = False
+            log(f"one-card evidence FAILED for the whole run: {len(pump.approved)} cards approved, "
+                f"{want} generation(s) started, codes at approval: {[p.get('_codeAtApproval') for p in pump.approved]}")
 
     log("\n==== SUMMARY ====")
     for name in ("generation-confirmation", "framed-contenteditable", "framed-textarea", "parent-control",
                  "ref-cross-composer", "ref-framed-textarea", "ref-sameorigin-composer",
-                 "background-framed-composer"):
+                 "framed-enter-submit", "background-framed-composer",
+                 "check-connection", "debug-report", "refresh-live", "refresh-dead-token",
+                 "check-connection-relay-down"):
         if name in results:
             log(f"{'PASS' if results[name] else 'FAIL'} {name}")
     for name, outcome in probes.items():

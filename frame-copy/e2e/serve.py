@@ -65,6 +65,12 @@ def _handler_b():
             if self.path in ("/", "/chat.html"):
                 with open(os.path.join(PAGES, "chat.html"), encoding="utf-8") as f:
                     return self._html(f.read().encode())
+            if self.path == "/chat-key.html":
+                # The keydown-submit composer page (v2.10 Enter case):
+                # submits only on a real Enter keydown, and reports the
+                # exact input events it received.
+                with open(os.path.join(PAGES, "chat-key.html"), encoding="utf-8") as f:
+                    return self._html(f.read().encode())
             self.send_error(404)
     return H
 

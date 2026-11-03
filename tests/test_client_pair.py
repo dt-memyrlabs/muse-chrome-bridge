@@ -124,6 +124,19 @@ def main():
         check("--force pairs fresh and overwrites, as before",
               code == 0 and out.get("ok") is True and open(tokfile).read() == "fresh-token-value", out)
 
+        # (f) dead token held (v2.10 refresh, case b): the relay rejects
+        # it at /status, so pair must NOT present it (a dead token can
+        # never attach to — or take over — any session), and the fresh
+        # token replaces it in the file cleanly.
+        with open(tokfile, "w") as f:
+            f.write("dead-token-value-that-is-long-enough")
+        MODE["pair"] = "fresh"
+        code, out = run_client(chatdir, "pair", "CODE0006", "--chat", "Chat A")
+        check("dead token held: pair sends no token field",
+              SEEN["pair_bodies"][-1].get("token") is None, SEEN["pair_bodies"][-1])
+        check("...pair succeeds fresh and the dead token file is replaced",
+              code == 0 and out.get("ok") is True and open(tokfile).read() == "fresh-token-value", out)
+
         # (e) no token presented and the relay renames the pair (a live
         # session already holds the name): pair succeeds but warns loudly
         otherdir = os.path.join(tmp, "other")

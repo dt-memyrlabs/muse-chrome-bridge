@@ -1,0 +1,74 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Frame Rig Chat — keydown-submit composer</title>
+<style>
+  body { margin: 0; font-family: sans-serif; padding: 10px; }
+  #messages { border: 1px solid #999; min-height: 110px; padding: 6px; margin: 0 0 10px 0; }
+  #composer { border: 1px solid #333; min-height: 44px; padding: 6px; margin-bottom: 10px; }
+  #send-btn { padding: 6px 18px; }
+</style>
+</head>
+<body>
+  <h1>Chat page with a keydown-submit composer (origin B, in an iframe)</h1>
+  <ul id="messages"></ul>
+
+  <label for="composer">Key composer</label>
+  <div id="composer" contenteditable="true" aria-label="Key composer"></div>
+
+  <button id="send-btn">Send</button>
+
+<script>
+  // This page models the chat apps the 2026-11-02 failure came from
+  // (factory.8090.ai): the composer submits ONLY on a real Enter
+  // keydown. Inserted text — typing, paste, Input.insertText newlines —
+  // never submits. The page records exactly what input it received
+  // (every keydown's key/code, every beforeinput type) so the rig can
+  // prove what the bridge delivered, not guess.
+  const messagesEl = document.getElementById('messages');
+  const composer = document.getElementById('composer');
+  const diag = { keydowns: 0, lastKey: '', lastCode: '', beforeinputs: [] };
+
+  function submit() {
+    const li = document.createElement('li');
+    li.textContent = composer.textContent;
+    messagesEl.appendChild(li);
+    composer.textContent = '';
+    report();
+  }
+
+  function report() {
+    parent.postMessage({
+      rig: 'frame-state',
+      page: 'key',
+      origin: location.origin,
+      messages: [...messagesEl.querySelectorAll('li')].map((li) => li.textContent),
+      note: '',
+      composer: composer.textContent,
+      diag: JSON.parse(JSON.stringify(diag))
+    }, '*');
+  }
+
+  composer.addEventListener('keydown', (e) => {
+    diag.keydowns += 1;
+    diag.lastKey = e.key;
+    diag.lastCode = e.code;
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submit();
+      return;
+    }
+    report();
+  });
+  composer.addEventListener('beforeinput', (e) => {
+    diag.beforeinputs.push(e.inputType + (e.data ? ':' + JSON.stringify(e.data) : ''));
+    if (diag.beforeinputs.length > 40) diag.beforeinputs.shift();
+    report();
+  });
+  composer.addEventListener('input', report);
+  document.getElementById('send-btn').addEventListener('click', submit);
+  report();
+</script>
+</body>
+</html>

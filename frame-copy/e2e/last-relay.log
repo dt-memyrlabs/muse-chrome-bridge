@@ -1,35 +1,53 @@
-[relay 20:25:00] device enrollment gate on (hello must prove the per-install secret)
-[relay 20:25:00] ws 127.0.0.1:19822  http 127.0.0.1:20822  state /tmp/frame-rig-_2lcr8yo/relay-state.json
-[relay 20:25:00] WARNING: no Tailscale address found (tailscale ip -4): chat API is loopback-only
-[relay 20:25:10] device 0235c490 online
-[relay 20:25:10] pairing code issued for device 0235c490
-[relay 20:25:11] session 8a259c paired to device 0235c490 (acked)
-[relay 20:25:12] cmd 8a259c tabs_context -> ok
-[relay 20:25:13] cmd 8a259c computer -> ok
-[relay 20:25:14] cmd 8a259c computer -> ok
-[relay 20:25:16] cmd 8a259c computer -> ok
-[relay 20:25:17] cmd 8a259c get_page_text -> ok
-[relay 20:25:18] cmd 8a259c computer -> ok
-[relay 20:25:18] cmd 8a259c computer -> ok
-[relay 20:25:19] cmd 8a259c get_page_text -> ok
-[relay 20:25:20] cmd 8a259c computer -> ok
-[relay 20:25:21] cmd 8a259c computer -> ok
-[relay 20:25:22] cmd 8a259c computer -> ok
-[relay 20:25:24] cmd 8a259c get_page_text -> ok
-[relay 20:25:24] cmd 8a259c find -> ok
-[relay 20:25:25] cmd 8a259c find -> ok
-[relay 20:25:25] cmd 8a259c find -> ok
-[relay 20:25:26] cmd 8a259c computer -> ok
-[relay 20:25:27] cmd 8a259c computer -> ok
-[relay 20:25:28] cmd 8a259c computer -> ok
-[relay 20:25:29] cmd 8a259c get_page_text -> ok
-[relay 20:25:30] cmd 8a259c form_input -> ok
-[relay 20:25:31] cmd 8a259c find -> ok
-[relay 20:25:32] cmd 8a259c find -> ok
-[relay 20:25:33] cmd 8a259c computer -> ok
-[relay 20:25:33] cmd 8a259c computer -> ok
-[relay 20:25:35] cmd 8a259c computer -> ok
-[relay 20:25:38] cmd 8a259c computer -> ok
-[relay 20:25:39] cmd 8a259c computer -> ok
-[relay 20:25:40] cmd 8a259c computer -> ok
-[relay 20:25:41] cmd 8a259c get_page_text -> ok
+[relay 00:25:53] device enrollment gate on (hello must prove the per-install secret)
+[relay 00:25:53] ws 127.0.0.1:19822  http 127.0.0.1:20822  state /tmp/frame-rig-vwkzu2s5/relay-state.json
+[relay 00:25:53] WARNING: no Tailscale address found (tailscale ip -4): chat API is loopback-only
+[relay 00:26:20] device 952d77f2 online
+[relay 00:26:21] pairing code issued for device 952d77f2
+[relay 00:26:23] session dc35ec paired to device 952d77f2 (acked)
+[relay 00:26:26] cmd dc35ec tabs_context -> ok
+[relay 00:26:30] cmd dc35ec computer -> ok
+[relay 00:26:32] cmd dc35ec computer -> ok
+[relay 00:26:35] cmd dc35ec computer -> ok
+[relay 00:26:38] cmd dc35ec get_page_text -> ok
+[relay 00:26:41] cmd dc35ec computer -> ok
+[relay 00:26:43] cmd dc35ec computer -> ok
+[relay 00:26:46] cmd dc35ec get_page_text -> ok
+[relay 00:26:49] cmd dc35ec computer -> ok
+[relay 00:26:53] cmd dc35ec computer -> ok
+[relay 00:26:56] cmd dc35ec computer -> ok
+[relay 00:26:58] cmd dc35ec get_page_text -> ok
+[relay 00:27:00] cmd dc35ec find -> ok
+[relay 00:27:02] cmd dc35ec find -> ok
+[relay 00:27:04] cmd dc35ec find -> ok
+[relay 00:27:07] cmd dc35ec computer -> ok
+[relay 00:27:12] cmd dc35ec computer -> ok
+[relay 00:27:15] cmd dc35ec computer -> ok
+[relay 00:27:18] cmd dc35ec get_page_text -> ok
+[relay 00:27:20] cmd dc35ec form_input -> ok
+[relay 00:27:23] cmd dc35ec find -> ok
+[relay 00:27:26] cmd dc35ec find -> ok
+[relay 00:27:30] cmd dc35ec computer -> ok
+[relay 00:27:35] cmd dc35ec computer -> ok
+[relay 00:27:39] cmd dc35ec computer -> ok
+[relay 00:27:43] cmd dc35ec computer -> ok
+[relay 00:27:47] cmd dc35ec computer -> ok
+[relay 00:27:50] cmd dc35ec computer -> ok
+[relay 00:27:53] cmd dc35ec computer -> ok
+[relay 00:27:56] cmd dc35ec computer -> ok
+[relay 00:28:00] cmd dc35ec computer -> ok
+[relay 00:28:06] cmd dc35ec computer -> ok
+[relay 00:28:09] cmd dc35ec computer -> ok
+[relay 00:28:13] cmd dc35ec computer -> ok
+[relay 00:28:16] cmd dc35ec get_page_text -> ok
+[relay 00:28:19] pairing code issued for device 952d77f2
+[relay 00:28:21] tab attached to session dc35ec (code redeemed with its token)
+[relay 00:28:23] cmd dc35ec computer -> ok
+[relay 00:28:27] cmd dc35ec computer -> ok
+[relay 00:28:30] cmd dc35ec computer -> ok
+[relay 00:28:33] pairing code issued for device 952d77f2
+[relay 00:28:35] session dc35ec revoked
+[relay 00:28:35] session d2fbba paired to device 952d77f2 (acked)
+[relay 00:28:37] cmd d2fbba tabs_context -> ok
+[relay 00:28:41] cmd d2fbba computer -> ok
+[relay 00:28:44] cmd d2fbba computer -> ok
+[relay 00:28:48] cmd d2fbba computer -> ok

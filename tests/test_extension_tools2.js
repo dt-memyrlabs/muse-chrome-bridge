@@ -5,8 +5,10 @@
  *  - upload_image: captured screenshots dropped back onto the page
  *    by id; local paths go through the file_upload machinery;
  *  - update_plan records the plan and permits its domains;
- *  - shortcuts_list / shortcuts_execute over the saved-prompt store;
- *  - javascript_tool present but DISABLED until enabled in the panel.
+ *  - javascript_tool present but permanently DISABLED (v2.10: the
+ *    panel toggle is gone; no storage value or message enables it);
+ *  - the saved-prompt machinery is gone (v2.10): shortcuts_list /
+ *    shortcuts_execute are unknown actions now.
  *
  *   node test_extension_tools2.js     exit 0 = all passed
  */
@@ -125,19 +127,19 @@ const dbg = (tabId, method, params) => E.dbgEvent.fire({ tabId }, method, params
   r = await cmd(A.sid, "resize_window", { tabId: T, width: 8000, height: 700 });
   check("resize_window refuses beyond 8K", !r.ok && r.error === "bad_size", r);
 
-  /* ---- javascript_tool: disabled by default ---- */
+  /* ---- javascript_tool: permanently disabled (v2.10) ---- */
   r = await cmd(A.sid, "javascript_tool", { action: "javascript_exec", text: "1+1", tabId: T });
-  check("javascript_tool refuses with javascript_disabled by default", !r.ok && r.error === "javascript_disabled", r);
+  check("javascript_tool refuses with javascript_disabled", !r.ok && r.error === "javascript_disabled", r);
   check("a disabled javascript_tool never reaches Runtime.evaluate",
         !cdpLog.some((c) => c.method === "Runtime.evaluate"), cdpLog.map((c) => c.method));
   await F.sw(`local.set("javascriptEnabled", true)`);
-  evalBox.result = { result: { value: 42 } };
   r = await cmd(A.sid, "javascript_tool", { action: "javascript_exec", text: "6*7", tabId: T });
-  check("once enabled in the panel, javascript_tool returns the value", r.ok && r.data.output === "42", r);
-  evalBox.result = { exceptionDetails: { text: "Uncaught", exception: { description: "ReferenceError: nope is not defined" } } };
-  r = await cmd(A.sid, "javascript_tool", { action: "javascript_exec", text: "nope", tabId: T });
-  check("a page exception comes back as javascript_error", !r.ok && r.error === "javascript_error" && /ReferenceError/.test(r.detail || ""), r);
-  evalBox.result = null;
+  check("a leftover javascriptEnabled storage value does NOT enable it (no enable path)",
+        !r.ok && r.error === "javascript_disabled", r);
+  check("Runtime.evaluate is still untouched after the storage attempt",
+        !cdpLog.some((c) => c.method === "Runtime.evaluate"), cdpLog.map((c) => c.method));
+  r = await panel("set_javascript_enabled", { enabled: true });
+  check("the panel's old javascript switch message is gone", !r || r.ok === false, r);
   await F.sw(`local.set("javascriptEnabled", false)`);
 
   /* ---- update_plan ---- */
@@ -151,19 +153,18 @@ const dbg = (tabId, method, params) => E.dbgEvent.fire({ tabId }, method, params
         chat.sites.includes("github.com") && chat.sites.includes("docs.example.com"),
         { r, plan: chat && chat.plan, sites: chat && chat.sites });
 
-  /* ---- shortcuts over the saved-prompt store ---- */
-  await F.sw(`setSavedPrompts([{ id: "prompt_1", name: "Daily check", prompt: "Check the dashboard and report.", command: "daily", createdAt: 1, usageCount: 0, lastUsedAt: null, url: "https://shop.example.com/", repeatType: "none" }])`);
+  /* ---- saved prompts are gone (v2.10) ---- */
   r = await cmd(A.sid, "shortcuts_list", {});
-  check("shortcuts_list shows the saved prompts",
-        r.ok && r.data.shortcuts.length === 1 && r.data.shortcuts[0].command === "daily", r.data);
+  check("shortcuts_list is no longer a tool", !r.ok, r);
   r = await cmd(A.sid, "shortcuts_execute", { command: "/daily" });
-  check("shortcuts_execute hands the prompt text to the calling chat",
-        r.ok && r.data.prompt === "Check the dashboard and report." && r.data.command === "daily", r);
-  r = await cmd(A.sid, "shortcuts_list", {});
-  check("executing records the usage", r.ok && r.data.shortcuts[0].usageCount === 1 && !!r.data.shortcuts[0].lastUsedAt, r.data);
-  r = await cmd(A.sid, "shortcuts_execute", { shortcutId: "prompt_nope" });
-  check("an unknown shortcut answers no_such_shortcut", !r.ok && r.error === "no_such_shortcut", r);
-  await F.sw(`setSavedPrompts([])`);
+  check("shortcuts_execute is no longer a tool", !r.ok, r);
+  r = await panel("prompt_save", { name: "x", prompt: "y", command: "z" });
+  check("the panel's prompt_save message is gone", !r || r.ok === false, r);
+  const stNoPrompts = await panel("state");
+  check("panel state carries no savedPrompts / promptRuns / javascriptEnabled fields",
+        stNoPrompts && !("savedPrompts" in stNoPrompts) && !("promptRuns" in stNoPrompts) &&
+        !("javascriptEnabled" in stNoPrompts) && !("recording" in stNoPrompts) && !("picking" in stNoPrompts),
+        stNoPrompts && Object.keys(stNoPrompts));
 
   /* ---- upload_image ---- */
   r = await cmd(A.sid, "screenshot", { tabId: T });

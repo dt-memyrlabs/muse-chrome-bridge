@@ -29,8 +29,7 @@ If two chats share a working folder, give each its own --token-file.
 Tools: tabs_context, tabs_create, tabs_close, navigate, read_page, find,
 get_page_text, get_form_values, screenshot, computer, form_input,
 file_upload, browser_batch, read_console_messages, read_network_requests,
-resize_window, upload_image, update_plan, shortcuts_list,
-shortcuts_execute, javascript_tool, gif_creator.
+resize_window, upload_image, update_plan, javascript_tool, gif_creator.
 (See SKILL.md for arguments.)
 
 Output is always one line of JSON. Exit code 0 = ok, 1 = the call failed,
@@ -410,7 +409,9 @@ def main(argv):
         # reads any page-derived field.
         res["pageContent"] = "untrusted"
     if res.get("error") == "bad_token":
-        res["detail"] = "this chat is no longer connected. Ask the user to share a page again, then pair with the new code."
+        res["detail"] = ("this chat is no longer connected — its token is dead. Ask the user to open the tab in the "
+                          "Muse Bridge panel and click Refresh connection (or Generate a code if the tab shows Not shared), "
+                          "then pair with the new code they paste you. Pairing replaces the dead token in your token file.")
     stamp = time.strftime("%Y%m%d-%H%M%S")
     save_images(res, os.path.join(home, "mbb-shots"), stamp, [0])
     text = json.dumps(res, ensure_ascii=False)

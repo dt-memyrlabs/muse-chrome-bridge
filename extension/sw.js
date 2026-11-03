@@ -22,7 +22,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.9.0";
+const VERSION = "2.10.0";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -276,6 +276,20 @@ function flushResultBuffer() {
   for (const b of keep) sendResult(b.msg);
 }
 
+/* One-shot questions to the relay over the device socket (the panel's
+ * Check connection asking whether a session is still live relay-side).
+ * Resolves with the relay's answer message, or null on timeout / a down
+ * link — the caller reports that as a failed step, never a silent one. */
+const relayQueries = new Map(); // id -> resolve
+function relayQuery(obj, timeoutMs = 6000) {
+  return new Promise((resolve) => {
+    const id = crypto.randomUUID();
+    const timer = setTimeout(() => { relayQueries.delete(id); resolve(null); }, timeoutMs);
+    relayQueries.set(id, (m) => { clearTimeout(timer); relayQueries.delete(id); resolve(m); });
+    if (!relaySend({ ...obj, id })) { clearTimeout(timer); relayQueries.delete(id); resolve(null); }
+  });
+}
+
 async function onRelay(msg) {
   switch (msg.t) {
     case "welcome":
@@ -303,6 +317,11 @@ async function onRelay(msg) {
     case "pair_error": {
       const s = await withShares((shares) => { const x = shares[msg.reqId]; delete shares[msg.reqId]; return x; });
       await audit("", "share", P.clip(msg.error, 60), "refused by relay");
+      return;
+    }
+    case "session_check_result": {
+      const q = relayQueries.get(msg.id);
+      if (q) q(msg);
       return;
     }
     case "paired": return onPaired(msg);
@@ -1124,8 +1143,8 @@ async function startShare(tabId, opts = {}) {
   // v2.9 (Daniel, 2026-10-30): the panel's Generate-a-code path asks the
   // ONE full-control confirmation at generation time — when Daniel
   // copies the code — not at redemption, when he may have moved on and
-  // forgotten the tab. Internal callers (the scheduled-prompt run)
-  // do not pass this flag: their shares keep the redemption-time card.
+  // forgotten the tab. Callers that do not pass this flag (the orphan
+  // Add path goes through its own prompt) keep the redemption-time card.
   const confirmAtGeneration = !!(opts && opts.confirmAtGeneration);
   const dropped = [];
   await withShares((shares) => {
@@ -1341,20 +1360,6 @@ async function onPaired(msg) {
     }
     await attachTab(msg.sessionId, tab);
     await audit(chatName, "paired", share.host, "connected");
-    // A scheduled prompt's run is delivered when a chat pairs with
-    // the code the run prepared: usage is recorded, the run closes.
-    if (share.runId) {
-      const runs = await local.get("promptRuns", []);
-      const run = runs.find((x) => x.id === share.runId);
-      if (run && run.status.startsWith("awaiting chat")) {
-        run.status = "delivered to " + chatName;
-        run.deliveredAt = Date.now();
-        await local.set("promptRuns", runs);
-        const list = await getSavedPrompts();
-        const p = list.find((x) => x.id === run.promptId);
-        if (p) { p.usageCount = (p.usageCount || 0) + 1; p.lastUsedAt = Date.now(); await setSavedPrompts(list); }
-      }
-    }
     ack(true);
   } catch (e) {
     ack(false, "pair_failed: " + ((e && e.message) || e));
@@ -4174,187 +4179,14 @@ TOOLS.update_plan = async (ctx, a) => {
   return { recorded: true, domains };
 };
 
-/* javascript_tool: present in the tool surface for parity, DISABLED
- * unless the user enables it in the panel. Daniel's standing rule for
- * this bridge bars arbitrary page script; the default stays safe. */
+/* javascript_tool: present in the tool surface for parity, and
+ * permanently DISABLED (v2.10: the panel toggle was removed with the
+ * rest of the helpers section). Daniel's standing rule for this
+ * bridge bars arbitrary page script; there is no enable path. */
 TOOLS.javascript_tool = async (ctx, a) => {
-  const enabled = await local.get("javascriptEnabled", false);
-  if (!enabled) throw fail("javascript_disabled",
-    "javascript_tool is disabled. It runs arbitrary code in the page, so it stays off unless the user enables it in the bridge panel.");
-  const code = String(a.text || a.code || "");
-  if (!code) throw fail("no_code", "give the code to run in 'text'");
-  const tab = await resolveTab(ctx, refTab(a));
-  await attach(tab.id);
-  const r = await cdp(tab.id, "Runtime.evaluate",
-    { expression: code, returnByValue: true, awaitPromise: true, userGesture: false }, 30000);
-  if (r && r.exceptionDetails) {
-    const ex = r.exceptionDetails.exception || {};
-    throw fail("javascript_error", P.clip(String(ex.description || ex.value || r.exceptionDetails.text || "evaluation failed"), 2000));
-  }
-  let out = "";
-  const res = (r && r.result) || {};
-  if (res.value !== undefined) out = typeof res.value === "string" ? res.value : JSON.stringify(res.value, null, 2) || String(res.value);
-  else if (res.description) out = String(res.description);
-  if (out.length > 51200) out = out.substring(0, 51200) + "\n[OUTPUT TRUNCATED: Exceeded 50KB limit]";
-  await audit(ctx.chat, "javascript_tool", P.clip(code, 120) + " @ " + P.hostOf(tab.url), "ok");
-  return { output: out, tabId: tab.id };
+  throw fail("javascript_disabled",
+    "javascript_tool is disabled and cannot be enabled. It runs arbitrary code in the page, and this bridge does not run page script.");
 };
-
-/* ---- saved prompts store (FULL-GAP §6; panel + alarms in stage H) - */
-const PROMPTS_KEY = "savedPrompts";
-async function getSavedPrompts() {
-  const v = await local.get(PROMPTS_KEY, []);
-  return Array.isArray(v) ? v : [];
-}
-async function setSavedPrompts(list) { await local.set(PROMPTS_KEY, list); }
-function promptByIdOrCommand(list, a) {
-  if (a.shortcutId || a.id) return list.find((p) => p.id === String(a.shortcutId || a.id)) || null;
-  if (a.command) { const c = String(a.command).replace(/^\//, ""); return list.find((p) => p.command === c) || null; }
-  return null;
-}
-
-TOOLS.shortcuts_list = async (ctx, a) => {
-  const list = await getSavedPrompts();
-  return { shortcuts: list.map((p) => ({ id: p.id, name: p.name, command: p.command,
-    repeatType: p.repeatType || "none", usageCount: p.usageCount || 0, lastUsedAt: p.lastUsedAt || null })) };
-};
-
-/* shortcuts_execute: Claude runs the saved prompt in its in-panel
- * chat. Ours has no in-browser agent — the chats are external — so
- * executing hands the full prompt text back to the calling chat,
- * which is the run. Usage is recorded the same way. */
-TOOLS.shortcuts_execute = async (ctx, a) => {
-  const list = await getSavedPrompts();
-  const p = promptByIdOrCommand(list, a);
-  if (!p) throw fail("no_such_shortcut", "no saved prompt with that id or command — shortcuts_list shows what exists");
-  p.usageCount = (p.usageCount || 0) + 1;
-  p.lastUsedAt = Date.now();
-  await setSavedPrompts(list);
-  await audit(ctx.chat, "shortcuts_execute", "/" + p.command, "ok");
-  return { id: p.id, name: p.name, command: p.command, prompt: p.prompt, url: p.url || null };
-};
-
-/* ---- saved prompts: schedules + runs (v2.8, FULL-GAP §6) ----------
- * Their SavedPromptsService semantics, adapted to our model: prompts
- * live locally; a schedule is a one-shot chrome.alarms alarm named by
- * the prompt id, recomputed after every fire/save/start; editing the
- * prompt TEXT revokes its approval, so the next run first re-asks
- * the ONE full-control confirmation (never a per-action prompt).
- * Their runs execute in an in-panel account chat; ours has no
- * in-browser agent, so a run opens its own window, starts a pairing
- * for its tab, and waits in the panel with the code and the prompt
- * text — the hand-off is the run. */
-function textHash(s) {
-  let h = 0x811c9dc5;
-  const str = String(s || "");
-  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
-  return "h" + h.toString(16);
-}
-function nextRunFor(p, now) {
-  const parts = String(p.specificTime || "09:00").split(":").map((x) => parseInt(x, 10));
-  const H = Number.isFinite(parts[0]) ? parts[0] : 9, M = Number.isFinite(parts[1]) ? parts[1] : 0;
-  const DAY = 86400000;
-  switch (p.repeatType) {
-    case "once": {
-      if (!p.specificDate) return null;
-      const d = new Date(p.specificDate + "T00:00:00");
-      if (isNaN(d)) return null;
-      d.setHours(H, M, 0, 0);
-      return d.getTime() > now ? d.getTime() : null;
-    }
-    case "daily": {
-      const d = new Date(now); d.setHours(H, M, 0, 0);
-      if (d.getTime() <= now) d.setTime(d.getTime() + DAY);
-      return d.getTime();
-    }
-    case "weekly": {
-      const want = Math.min(6, Math.max(0, parseInt(p.dayOfWeek, 10) || 0));
-      const d = new Date(now); d.setHours(H, M, 0, 0);
-      for (let i = 0; i < 8; i++) { if (d.getDay() === want && d.getTime() > now) return d.getTime(); d.setTime(d.getTime() + DAY); }
-      return null;
-    }
-    case "monthly": {
-      const want = Math.min(31, Math.max(1, parseInt(p.dayOfMonth, 10) || 1));
-      for (let add = 0; add < 3; add++) {
-        const d = new Date(now); d.setDate(1); d.setMonth(d.getMonth() + add);
-        const last = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
-        d.setDate(Math.min(want, last)); d.setHours(H, M, 0, 0);
-        if (d.getTime() > now) return d.getTime();
-      }
-      return null;
-    }
-    case "annually": {
-      const md = String(p.monthAndDay || "01-01").split("-").map((x) => parseInt(x, 10));
-      const mo = Math.min(11, Math.max(0, (md[0] || 1) - 1)), da = Math.min(31, Math.max(1, md[1] || 1));
-      for (let add = 0; add < 3; add++) {
-        const y = new Date(now).getFullYear() + add;
-        const last = new Date(y, mo + 1, 0).getDate();
-        const d = new Date(y, mo, Math.min(da, last), H, M, 0, 0);
-        if (d.getTime() > now) return d.getTime();
-      }
-      return null;
-    }
-    default: return null;
-  }
-}
-async function syncPromptAlarm(p) {
-  try { await chrome.alarms.clear(p.id); } catch (e) {}
-  const when = nextRunFor(p, Date.now());
-  if (when) { try { chrome.alarms.create(p.id, { when }); } catch (e) {} }
-}
-async function syncAllAlarms() {
-  for (const p of await getSavedPrompts()) await syncPromptAlarm(p);
-}
-async function recordRun(run) {
-  const runs = await local.get("promptRuns", []);
-  runs.push(run);
-  await local.set("promptRuns", runs.slice(-50));
-}
-async function runScheduledPrompt(p) {
-  await syncPromptAlarm(p); // reschedule first, as theirs does
-  const run = { id: "run_" + Date.now(), promptId: p.id, name: p.name, at: Date.now(), status: "" };
-  if (textHash(p.prompt) !== p.approvedTextHash) {
-    let ok = false;
-    try {
-      await ask({ sessionId: "schedule:" + p.id, chat: "Scheduled · " + p.name, tabId: null, job: null },
-        `Run the scheduled prompt "${p.name}"?`,
-        "Its text changed since it was last approved. Allowing runs it as written now: it opens its own window and prepares a tab to hand to a chat, with the same full control a shared tab carries.",
-        p.url || "", { ms: SHARE_CONFIRM_MS });
-      ok = true;
-    } catch (e) { ok = false; }
-    if (!ok) {
-      run.status = "skipped — the changed prompt was not confirmed";
-      await recordRun(run);
-      await audit("Scheduled · " + p.name, "scheduled run", "/" + p.command, "skipped: changed prompt not confirmed");
-      notifyPanel();
-      return run;
-    }
-    const list = await getSavedPrompts();
-    const cur = list.find((x) => x.id === p.id);
-    if (cur) { cur.approvedTextHash = textHash(cur.prompt); await setSavedPrompts(list); }
-  }
-  try {
-    const win = await chrome.windows.create({ url: p.url || "about:blank", focused: false });
-    const tab = win && win.tabs && win.tabs[0];
-    if (!tab) throw new Error("the new window has no tab");
-    run.tabId = tab.id;
-    if (p.url) {
-      const reqId = await startShare(tab.id);
-      await withShares((shares) => { if (shares[reqId]) shares[reqId].runId = run.id; });
-      run.reqId = reqId;
-      run.status = "awaiting chat — pair with the code in the panel";
-    } else {
-      run.status = "window opened — share a page in it from the panel to hand it to a chat";
-    }
-  } catch (e) {
-    run.status = "failed — " + P.clip(String((e && e.message) || e), 120);
-  }
-  await recordRun(run);
-  await audit("Scheduled · " + p.name, "scheduled run", "/" + p.command, run.status);
-  notifyPanel();
-  return run;
-}
-
 /* ---- GIF recording (v2.8, FULL-GAP §7) ------------------------------
  * Per chat: while recording, the framed actions leave a frame each
  * (captured like a screenshot, indicators hidden), capped at 50 as
@@ -4560,6 +4392,111 @@ function fromOurPage(sender) {
          typeof sender.url === "string" && sender.url.startsWith(chrome.runtime.getURL(""));
 }
 
+/* -------------------------------------------- connection check + report
+ * The panel's Connection area (v2.10, Daniel 2026-11-02): Check
+ * connection runs a real end-to-end probe for ONE tab and reports every
+ * step, pass or fail, with the actual error text — no silent failures.
+ * The round-trip step runs through the session's own command path (the
+ * same sessionCtx + TOOLS dispatch a relay command takes), never a
+ * panel shortcut. Copy debug report renders the same facts as plain
+ * text the user can paste into any chat, on any machine. The report
+ * NEVER carries a chat token (the extension never holds one), an
+ * enroll secret, a pairing code, or page content: it is built only
+ * from connection facts and the event record, whose entries already
+ * keep secret values as character counts. */
+async function checkConnection(tabId) {
+  const steps = [];
+  const step = (name, ok, detail) => steps.push({ name, ok: !!ok, detail: String(detail || "") });
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) { step("Tab", false, "this tab is gone"); return steps; }
+  const up = !!(ws && wsReady && ws.readyState === WebSocket.OPEN);
+  step("Relay reachable", up, up ? DEFAULT_RELAY + " — connected"
+    : (await local.get("relayError", "")) || "the extension is not connected to the relay");
+  const sid = await ownerOf(tabId);
+  const sessions = await getSessions();
+  const sess = sid ? sessions[sid] : null;
+  if (!up) {
+    step("Session still valid at the relay", false, "not checked — the relay is unreachable");
+    step("Tab in the chat's tab group", false, "not checked — the relay is unreachable");
+    step("Control round-trip", false, "not checked — the relay is unreachable");
+    return steps;
+  }
+  if (!sess) {
+    step("Session still valid at the relay", false, "this tab is not shared with any chat");
+    step("Tab in the chat's tab group", false, "not checked — the tab is not shared");
+    step("Control round-trip", false, "not checked — the tab is not shared");
+    return steps;
+  }
+  const ans = await relayQuery({ t: "session_check", sessionId: sid });
+  step("Session still valid at the relay", !!(ans && ans.live === true),
+    !ans ? "the relay did not answer the session check"
+      : ans.live ? "session for \u201c" + sess.chatName + "\u201d is live at the relay"
+      : "the relay no longer knows this chat's session — its token is dead. Use Refresh connection and pair with the new code.");
+  let grouped = false, groupDetail = "";
+  try {
+    if (tab.groupId == null || tab.groupId === -1) groupDetail = "the tab is in no tab group";
+    else {
+      const g = await chrome.tabGroups.get(tab.groupId).catch(() => null);
+      grouped = !!(g && sameGroupTitle(g.title, groupTitle(sess)));
+      groupDetail = grouped ? "group \u201c" + groupTitle(sess) + "\u201d"
+        : "the tab sits in a different group" + (g && g.title ? " (\u201c" + g.title + "\u201d)" : "");
+    }
+  } catch (e) { groupDetail = String((e && e.message) || e); }
+  if (!grouped && sess.groupError) groupDetail += " — Chrome said: " + String(sess.groupError.text || "");
+  step("Tab in the chat's tab group", grouped, groupDetail);
+  try {
+    const ctx = await sessionCtx(sid);
+    const data = await TOOLS.tabs_context(ctx, {});
+    const mine = (data.tabs || []).find((t) => t.tabId === tabId);
+    if (!mine) step("Control round-trip", false, "tabs_context through the session did not list this tab");
+    else if (mine.title === undefined) step("Control round-trip", false, "the session listed the tab without its title (site not permitted)");
+    else step("Control round-trip", mine.title === (tab.title || ""),
+      mine.title === (tab.title || "") ? "tabs_context through the session read this tab and its current title"
+                                       : "the title read through the session does not match the tab's current title");
+  } catch (e) {
+    const out = errOf(e);
+    step("Control round-trip", false, out.error + (out.detail ? ": " + out.detail : ""));
+  }
+  return steps;
+}
+
+async function buildDebugReport(tabId, opts = {}) {
+  const sessions = await getSessions();
+  const sid = await ownerOf(tabId);
+  const sess = sid ? sessions[sid] : null;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const up = !!(ws && wsReady && ws.readyState === WebSocket.OPEN);
+  const lines = [];
+  lines.push("Muse Chrome Bridge — connection debug report");
+  lines.push("Time: " + new Date().toISOString());
+  lines.push("Browser: " + String(opts.ua || "unknown"));
+  lines.push("Extension version: " + VERSION);
+  lines.push("Relay: " + DEFAULT_RELAY + " — " + (up ? "reachable"
+    : "NOT reachable" + ((await local.get("relayError", "")) ? " (" + (await local.get("relayError", "")) + ")" : "")));
+  lines.push("Chat controlling this tab: " + (sess ? String(sess.chatName) : "none"));
+  if (tab) {
+    let group = "in no tab group";
+    if (tab.groupId != null && tab.groupId !== -1) {
+      const g = await chrome.tabGroups.get(tab.groupId).catch(() => null);
+      group = g ? "in group \u201c" + String(g.title || "") + "\u201d"
+        + (sess && sameGroupTitle(g.title, groupTitle(sess)) ? " (this chat's group)" : " (not this chat's group)")
+        : "in a group the bridge cannot read";
+    }
+    lines.push("Tab: " + P.hostOf(tab.url) + " — " + group);
+  } else lines.push("Tab: gone");
+  lines.push("");
+  lines.push("Check connection:");
+  const check = Array.isArray(opts.check) ? opts.check : [];
+  if (!check.length) lines.push("  (not run yet — press Check connection first)");
+  for (const st of check) lines.push("  " + (st.ok ? "PASS" : "FAIL") + " " + String(st.name) + (st.detail ? " — " + String(st.detail) : ""));
+  lines.push("");
+  lines.push("Recent activity (last 20):");
+  const log = (await local.get("audit", [])).slice(-20);
+  if (!log.length) lines.push("  (nothing recorded)");
+  for (const a of log) lines.push("  " + new Date(a.ts).toISOString() + " · " + (a.chat ? a.chat + " · " : "") + a.action + " · " + a.detail + " · " + a.outcome);
+  return lines.join("\n");
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   // The pill in a shared tab may only ask to stop sharing its own tab.
   if (msg && msg.kind === "pill_remove" && sender && sender.id === chrome.runtime.id && sender.tab && sender.frameId === 0) {
@@ -4605,47 +4542,6 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         await sess.set("staticDismissed", d);
         await agentUI(tabId, { static: false });
       }
-      respond({ ok: true });
-    })().catch(() => respond({ ok: false }));
-    return true;
-  }
-  // Panel helpers driven from page content (v2.8, FULL-GAP §12): the
-  // workflow recorder's steps and the element picker's result. Same
-  // sender discipline: our extension, top frame, a real tab — and a
-  // step is accepted only from the tab being recorded, a pick only
-  // from the tab being picked.
-  if (msg && sender && sender.id === chrome.runtime.id && sender.tab && sender.frameId === 0 &&
-      ["wf_step", "pick_result", "pick_cancel"].includes(msg.kind)) {
-    (async () => {
-      const tabId = sender.tab.id;
-      if (msg.kind === "wf_step") {
-        const rec = await sess.get("wfRecording", null);
-        if (!rec || rec.tabId !== tabId || !msg.step) { respond({ ok: false }); return; }
-        rec.steps = rec.steps || [];
-        if (rec.steps.length < 200) {
-          const step = { kind: String(msg.step.kind || ""), desc: P.clip(String(msg.step.desc || ""), 200),
-                         url: String(msg.step.url || ""), at: Date.now() };
-          if (sender.tab.active) {
-            step.shot = await chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: "jpeg", quality: 40 }).catch(() => null);
-          }
-          rec.steps.push(step);
-          await sess.set("wfRecording", rec);
-        }
-        notifyPanel();
-        respond({ ok: true });
-        return;
-      }
-      if (msg.kind === "pick_result") {
-        const picking = await sess.get("picking", null);
-        if (!picking || picking.tabId !== tabId) { respond({ ok: false }); return; }
-        await sess.set("lastPick", { ...(msg.pick || {}), at: Date.now() });
-        await sess.set("picking", null);
-        notifyPanel();
-        respond({ ok: true });
-        return;
-      }
-      await sess.set("picking", null); // pick_cancel
-      notifyPanel();
       respond({ ok: true });
     })().catch(() => respond({ ok: false }));
     return true;
@@ -4713,17 +4609,12 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
                                   confirmedAtGeneration: !!share[1].confirmedAtGeneration,
                                   stalled: !share[1].code && !share[1].genConfirmPending && Date.now() - (share[1].created || 0) > 10000 } : null,
                  chats, prompts: [...pending].map(([id, p]) => ({ id, chat: p.chat, title: p.title, detail: p.detail, url: p.url, created: p.created, expiresAt: p.expiresAt })),
-                 savedPrompts: await getSavedPrompts(),
-                 promptRuns: (await local.get("promptRuns", [])).slice(-5).reverse().map((r) => ({
-                   ...r, code: (Object.values(shares).find((s) => s.runId === r.id) || {}).code || null })),
-                 javascriptEnabled: !!(await local.get("javascriptEnabled", false)),
-                 recording: await (async () => { const r = await sess.get("wfRecording", null);
-                   return r ? { active: true, tabId: r.tabId, steps: (r.steps || []).length, startedAt: r.startedAt } : { active: false }; })(),
-                 lastPick: await sess.get("lastPick", null),
-                 picking: !!(await sess.get("picking", null)),
                  audit: (await local.get("audit", [])).slice(-40).reverse() };
       }
       case "share": return { ok: true, reqId: await startShare(Number(msg.tabId), { confirmAtGeneration: true }) };
+      case "check_connection": return { ok: true, steps: await checkConnection(Number(msg.tabId)) };
+      case "debug_report": return { ok: true, text: await buildDebugReport(Number(msg.tabId),
+          { ua: String(msg.ua || ""), check: Array.isArray(msg.check) ? msg.check : [] }) };
       case "add_tab": await addTab(String(msg.sessionId || ""), Number(msg.tabId)); return { ok: true };
       case "remove_tab": {
         const chat = await releaseTab(Number(msg.tabId));
@@ -4732,115 +4623,6 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         return { ok: true };
       }
       case "start_relay": return await startRelay(true);
-      case "wf_start": {
-        const tab = await chrome.tabs.get(Number(msg.tabId)).catch(() => null);
-        if (!tab) return { ok: false, error: "no_tab" };
-        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["recorder.js"] });
-        await sess.set("wfRecording", { tabId: tab.id, startedAt: Date.now(), steps: [] });
-        await audit("panel", "workflow recording", P.hostOf(tab.url || ""), "started");
-        notifyPanel();
-        return { ok: true };
-      }
-      case "wf_stop": {
-        const rec = await sess.get("wfRecording", null);
-        await sess.set("wfRecording", null);
-        if (!rec || !(rec.steps || []).length) return { ok: true, steps: 0 };
-        const lines = rec.steps.map((s, i) => `${i + 1}. ${s.desc}${s.url ? " — " + s.url : ""}`);
-        const list = await getSavedPrompts();
-        let command = "workflow", n = 2;
-        while (list.some((p) => p.command === command)) command = "workflow-" + (n++);
-        const rec2 = { id: "prompt_" + Date.now(), name: "Recorded workflow", prompt: lines.join("\n"),
-          command, createdAt: Date.now(), usageCount: 0, lastUsedAt: null,
-          url: rec.steps[0].url || null, repeatType: "none" };
-        list.push(rec2);
-        await setSavedPrompts(list);
-        await audit("panel", "workflow recording", rec.steps.length + " steps", "saved as /" + command);
-        notifyPanel();
-        return { ok: true, steps: rec.steps.length, promptId: rec2.id };
-      }
-      case "prompt_save": {
-        const name = P.clip(String(msg.name || ""), 80).trim();
-        const text = String(msg.prompt || "");
-        if (!name || !text.trim()) return { ok: false, error: "name_and_prompt_required" };
-        let command = String(msg.command || "").trim().replace(/^\//, "").toLowerCase().replace(/\s+/g, "-");
-        if (!command) command = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "prompt";
-        const list = await getSavedPrompts();
-        if (list.some((p) => p.command === command)) return { ok: false, error: "command_taken", detail: "/" + command + " is already in use" };
-        const p = { id: "prompt_" + Date.now(), name, prompt: text, command, createdAt: Date.now(), usageCount: 0, lastUsedAt: null,
-          url: msg.url ? String(msg.url) : null, repeatType: String(msg.repeatType || "none"),
-          specificTime: msg.specificTime || "09:00", specificDate: msg.specificDate || null,
-          dayOfWeek: msg.dayOfWeek != null ? Number(msg.dayOfWeek) : null,
-          dayOfMonth: msg.dayOfMonth != null ? Number(msg.dayOfMonth) : null,
-          monthAndDay: msg.monthAndDay || null, approvedTextHash: textHash(text) };
-        list.push(p);
-        await setSavedPrompts(list);
-        await syncPromptAlarm(p);
-        notifyPanel();
-        return { ok: true, id: p.id };
-      }
-      case "prompt_update": {
-        const list = await getSavedPrompts();
-        const p = list.find((x) => x.id === String(msg.id));
-        if (!p) return { ok: false, error: "no_such_prompt" };
-        if (msg.command !== undefined) {
-          const c = String(msg.command || "").trim().replace(/^\//, "").toLowerCase().replace(/\s+/g, "-");
-          if (c && c !== p.command && list.some((x) => x.command === c))
-            return { ok: false, error: "command_taken", detail: "/" + c + " is already in use" };
-          if (c) p.command = c;
-        }
-        for (const k of ["name", "prompt", "url", "repeatType", "specificTime", "specificDate", "dayOfWeek", "dayOfMonth", "monthAndDay"])
-          if (msg[k] !== undefined) p[k] = (k === "dayOfWeek" || k === "dayOfMonth") && msg[k] != null ? Number(msg[k]) : msg[k];
-        // A text change is deliberately NOT re-approved here: the
-        // stored approval hash stops matching, so the next scheduled
-        // run re-asks the one confirmation (their revoke-on-edit).
-        await setSavedPrompts(list);
-        await syncPromptAlarm(p);
-        notifyPanel();
-        return { ok: true };
-      }
-      case "prompt_delete": {
-        const list = await getSavedPrompts();
-        const p = list.find((x) => x.id === String(msg.id));
-        if (!p) return { ok: false, error: "no_such_prompt" };
-        await setSavedPrompts(list.filter((x) => x.id !== p.id));
-        try { await chrome.alarms.clear(p.id); } catch (e) {}
-        notifyPanel();
-        return { ok: true };
-      }
-      case "prompt_run_now": {
-        const p = (await getSavedPrompts()).find((x) => x.id === String(msg.id));
-        if (!p) return { ok: false, error: "no_such_prompt" };
-        const run = await runScheduledPrompt(p);
-        return { ok: true, run };
-      }
-      case "pick_start": {
-        const tab = await chrome.tabs.get(Number(msg.tabId)).catch(() => null);
-        if (!tab) return { ok: false, error: "no_tab" };
-        await sess.set("picking", { tabId: tab.id, at: Date.now() });
-        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["picker.js"] });
-        notifyPanel();
-        return { ok: true };
-      }
-      case "set_javascript_enabled": {
-        await local.set("javascriptEnabled", !!msg.enabled);
-        await audit("panel", "javascript_tool", msg.enabled ? "enabled in the panel" : "disabled in the panel", "ok");
-        notifyPanel();
-        return { ok: true };
-      }
-      case "debug_export": {
-        const sessions = await getSessions();
-        const out = { version: VERSION, exportedAt: new Date().toISOString(),
-          sessions: [], pendingPrompts: [...pending].map(([, p]) => ({ chat: p.chat, title: p.title })),
-          audit: (await local.get("audit", [])).slice(-100),
-          settings: { javascriptEnabled: !!(await local.get("javascriptEnabled", false)) },
-          savedPrompts: (await getSavedPrompts()).length };
-        for (const [sid, s] of Object.entries(sessions)) {
-          const tids = await sessionTabs(sid);
-          out.sessions.push({ chatName: s.chatName, sites: Object.keys(s.sites || {}),
-            tabs: tids.map((t) => ({ host: P.hostOf(t.url || ""), title: t.title || "" })) });
-        }
-        return { ok: true, export: out };
-      }
       case "cancel_share": {
         const cancelled = await withShares((shares) => { const s = shares[msg.reqId]; delete shares[msg.reqId]; return s || null; });
         relaySend({ t: "pair_cancel", reqIds: [String(msg.reqId)] });
@@ -4903,18 +4685,11 @@ async function sweepIdle() {
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "mbb-keepalive") { if (!ws) connect(); }
   if (a.name === "mbb-idle") sweepIdle();
-  if (typeof a.name === "string" && a.name.startsWith("prompt_")) {
-    (async () => {
-      const p = (await getSavedPrompts()).find((x) => x.id === a.name);
-      if (p) await runScheduledPrompt(p);
-    })().catch(() => {});
-  }
 });
 // A new worker starts with nothing in memory: clear what the old one left
 // on screen (badge, prompt notifications) and any debugger sessions it had.
 async function cleanupAfterRestart() {
   chrome.action.setBadgeText({ text: "" }).catch(() => {});
-  syncAllAlarms().catch(() => {}); // saved-prompt schedules re-arm after a restart
   // Un-mute any tab the previous worker muted for focus emulation
   // (Claude's startup sweep): the stored list is ours alone, and a tab
   // we muted must not stay muted because the worker restarted.
