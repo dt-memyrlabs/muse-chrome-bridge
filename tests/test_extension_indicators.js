@@ -1,11 +1,13 @@
 /* v2.8 stage D: indicator depth at Claude in Chrome parity.
  *  - while a command runs on a tab, the tab's agent layer is driven
- *    {working:true}; when it ends, {working:false, static:true};
- *    the chat's other tabs carry the static pill state;
+ *    {working:true}; when it ends, {working:false} — and NO static
+ *    state is ever sent (v2.10.3 removed the second, static pill:
+ *    one pill only, the pill.js pill);
  *  - the in-page Stop button's message cancels the in-flight command
  *    (the result comes back "canceled") and is written to the record;
- *  - the static pill's heartbeat answers active only while the chat
- *    owns the tab and the pill was not dismissed;
+ *  - the removed pill's messages (agent_heartbeat,
+ *    agent_dismiss_static, agent_open_chat) are dead: the heartbeat
+ *    never answers active and none of them drives the agent layer;
  *  - the group title carries ⌛ working / 🔔 waiting / ✅ done, and
  *    group identity survives the prefixes.
  *
@@ -81,17 +83,20 @@ const bare = (t) => String(t || "").replace(/^(⌛|🔔|✅)\s?/, "");
   check("setup: the chat holds two grouped tabs",
         r.ok && tabs.get(T).groupId > -1 && tabs.get(T).groupId === tabs.get(T2).groupId, { r, g: [tabs.get(T).groupId, tabs.get(T2).groupId] });
 
-  /* ---- working layer during a command, static layer after ---- */
+  /* ---- working layer during a command, and NO static pill after ---- */
   agentUILog.length = 0;
   page.point = () => ({ tag: "div", text: "", fp: "div|plain" });
   r = await cmd(A.sid, "computer", { action: "left_click", coordinate: [5, 5], tabId: T });
   const seq = agentUILog.filter((e) => e.tabId === T && e.arg && typeof e.arg.working === "boolean").map((e) => e.arg.working);
   check("the worked tab is driven working:true while the command runs and working:false after",
         r.ok && seq.includes(true) && seq.lastIndexOf(false) > seq.indexOf(true), seq);
-  check("after the command the worked tab settles to the static state",
-        agentUIOf[T] && agentUIOf[T].working === false && agentUIOf[T].static === true, agentUIOf[T]);
-  check("the chat's other tab carries the static pill state",
-        agentUIOf[T2] && agentUIOf[T2].working === false && agentUIOf[T2].static === true, agentUIOf[T2]);
+  check("after the command the worked tab settles with no static state (the second pill is gone)",
+        agentUIOf[T] && agentUIOf[T].working === false && !("static" in agentUIOf[T]), agentUIOf[T]);
+  check("the chat's other tab is driven with no static state either",
+        agentUIOf[T2] && agentUIOf[T2].working === false && !("static" in agentUIOf[T2]), agentUIOf[T2]);
+  check("no agent-ui command in the whole run carries a static property",
+        agentUILog.every((e) => !e.arg || !("static" in e.arg)),
+        agentUILog.filter((e) => e.arg && "static" in e.arg).slice(0, 3));
 
   /* ---- indicators hide for captures ---- */
   const v0 = visualLog.length;
@@ -126,16 +131,19 @@ const bare = (t) => String(t || "").replace(/^(⌛|🔔|✅)\s?/, "");
   check("with the job gone the title returns to ✅ and identity is intact",
         groupOf(T).title.startsWith("✅") && bare(groupOf(T).title) === "Muse · Chat A", groupOf(T).title);
 
-  /* ---- heartbeat + dismiss ---- */
+  /* ---- the removed pill's messages are dead (v2.10.3) ---- */
   let hb = await tabMsg("agent_heartbeat", tabs.get(T2));
-  check("the static pill heartbeat answers active while the chat owns the tab", hb && hb.active === true, hb);
+  check("the static pill heartbeat no longer answers active", !(hb && hb.active === true), hb);
+  const logBefore = agentUILog.length;
   await tabMsg("agent_dismiss_static", tabs.get(T2));
-  check("dismissing takes the static layer down", agentUIOf[T2] && agentUIOf[T2].static === false, agentUIOf[T2]);
-  hb = await tabMsg("agent_heartbeat", tabs.get(T2));
-  check("after dismissal the heartbeat answers inactive", hb && hb.active === false, hb);
+  await tabMsg("agent_open_chat", tabs.get(T2));
+  check("dismiss / open-chat messages drive nothing in the agent layer",
+        agentUILog.length === logBefore && agentUIOf[T2] && !("static" in agentUIOf[T2]),
+        { added: agentUILog.slice(logBefore), cur: agentUIOf[T2] });
   r = await cmd(A.sid, "computer", { action: "left_click", coordinate: [6, 6], tabId: T });
-  check("a dismissed pill stays dismissed across later refreshes",
-        r.ok && agentUIOf[T2] && agentUIOf[T2].static === false, agentUIOf[T2]);
+  check("later refreshes still send no static state to any tab",
+        r.ok && agentUIOf[T2] && !("static" in agentUIOf[T2]) && agentUIOf[T] && !("static" in agentUIOf[T]),
+        { t2: agentUIOf[T2], t: agentUIOf[T] });
 
   /* ---- the Stop button cancels the in-flight command ---- */
   const wid = cmdStart(A.sid, "computer", { action: "wait", duration: 3, tabId: T });
@@ -157,7 +165,7 @@ const bare = (t) => String(t || "").replace(/^(⌛|🔔|✅)\s?/, "");
   await panel("remove_tab", { tabId: T2 });
   await tick(20);
   hb = await tabMsg("agent_heartbeat", { id: T2, url: "https://shop.example.com/other", windowId: 1 });
-  check("once the tab is released the heartbeat answers inactive", hb && hb.active === false, hb);
+  check("once the tab is released the heartbeat still does not answer active", !(hb && hb.active === true), hb);
 
   console.log(`\n${passes} passed, ${failures} failed`);
   process.exit(failures ? 1 : 0);

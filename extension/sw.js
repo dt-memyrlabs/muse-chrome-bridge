@@ -22,7 +22,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.10.2";
+const VERSION = "2.10.3";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -1443,10 +1443,13 @@ function noteJobTab(ctx, tabId) {
 
 /* -------------------------------------------------- agent indicators */
 // v2.8 (FULL-GAP §8): while a chat works, its tab shows the working
-// layer — a pulsing glow border and a Stop button — and the chat's
-// other tabs show the static "Muse is active in this tab group"
-// pill. agent-ui.js draws them; these helpers drive it the way the
-// pill and cursor are driven. Best-effort presentation, like theirs.
+// layer — a pulsing glow border and a Stop button. agent-ui.js draws
+// them; these helpers drive it the way the pill and cursor are
+// driven. Best-effort presentation, like theirs.
+// v2.10.3: the static "Muse is active in this tab group" pill the
+// layer used to draw on the chat's other tabs is removed — one pill
+// only (pill.js). The static state, its dismissal store and its
+// heartbeat are gone with it.
 const workingTabs = new Map(); // tabId -> Set<jobId>
 const agentUIReady = new Map(); // tabId -> url agent-ui.js was injected into
 async function agentUI(tabId, cmd) {
@@ -1467,18 +1470,13 @@ async function agentUI(tabId, cmd) {
       func: (c) => { if (window.__museBridgeAgentUI) return window.__museBridgeAgentUI(c); }, args: [cmd] });
   } catch (e) { /* not scriptable: no show */ }
 }
-async function staticDismissed(sessionId, tabId) {
-  const d = await sess.get("staticDismissed", {});
-  return !!(d && d[sessionId + ":" + tabId]);
-}
 async function refreshAgentIndicators(sessionId) {
   const s = (await getSessions())[sessionId];
   if (!s) return;
   for (const idStr of Object.keys(s.tabs || {})) {
     const tabId = Number(idStr);
     const working = (workingTabs.get(tabId) || new Set()).size > 0;
-    const statik = !working && !(await staticDismissed(sessionId, tabId));
-    await agentUI(tabId, { working, static: statik });
+    await agentUI(tabId, { working });
   }
 }
 function jobFinished(job) {
@@ -4506,18 +4504,16 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
     }, () => respond({ ok: false }));
     return true;
   }
-  // The agent layer in a shared tab (agent-ui.js): its Stop button,
-  // its static pill, and the pill's heartbeat. Same sender discipline
-  // as the pill: our own extension, top frame, a real tab.
+  // The agent layer in a shared tab (agent-ui.js): its Stop button.
+  // Same sender discipline as the pill: our own extension, top
+  // frame, a real tab. (v2.10.3 removed the static pill, so its
+  // agent_open_chat / agent_dismiss_static / agent_heartbeat
+  // messages no longer exist and are no longer handled.)
   if (msg && sender && sender.id === chrome.runtime.id && sender.tab && sender.frameId === 0 &&
-      ["agent_stop", "agent_stop_dropped", "agent_open_chat", "agent_dismiss_static", "agent_heartbeat"].includes(msg.kind)) {
+      ["agent_stop", "agent_stop_dropped"].includes(msg.kind)) {
     (async () => {
       const tabId = sender.tab.id;
       const sid = await ownerOf(tabId);
-      if (msg.kind === "agent_heartbeat") {
-        respond({ active: !!sid && !(await staticDismissed(sid, tabId)) });
-        return;
-      }
       if (!sid) { respond({ ok: false }); return; }
       const s = (await getSessions())[sid];
       const chat = s ? s.chatName : sid;
@@ -4529,18 +4525,11 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
         await audit(chat, "stopped from the page", P.hostOf(sender.tab.url || ""), "ok");
         // Immediate visual answer: the working layer comes down now;
         // jobFinished re-renders the steady state when results land.
-        await agentUI(tabId, { working: false, static: !(await staticDismissed(sid, tabId)) });
+        await agentUI(tabId, { working: false });
         refreshGroupPrefix(sid).catch(() => {});
         notifyPanel();
       } else if (msg.kind === "agent_stop_dropped") {
         await audit(chat, "stop from the page did not land", P.hostOf(sender.tab.url || ""), "dropped");
-      } else if (msg.kind === "agent_open_chat") {
-        if (chrome.sidePanel && chrome.sidePanel.open) await chrome.sidePanel.open({ windowId: sender.tab.windowId }).catch(() => {});
-      } else if (msg.kind === "agent_dismiss_static") {
-        const d = await sess.get("staticDismissed", {});
-        d[sid + ":" + tabId] = 1;
-        await sess.set("staticDismissed", d);
-        await agentUI(tabId, { static: false });
       }
       respond({ ok: true });
     })().catch(() => respond({ ok: false }));

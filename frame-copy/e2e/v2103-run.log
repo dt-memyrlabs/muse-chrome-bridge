@@ -1,0 +1,188 @@
+rig tmp dir: /tmp/frame-rig-jm0g5sgq
+extension under test: /home/hatch/workspace/muse-browser-bridge/attach-on-redeem/extension
+origins up: A=http://frame-a.test:8971 B=http://frame-b.test:8972
+relay up (enroll-secret gated)
+chromium up
+/home/hatch/workspace/muse-browser-bridge/frame-copy/e2e/run_e2e.py:119: DeprecationWarning: connect() must be used as a context manager: with connect(...) as websocket: ...; alternatively, use websocket = connect(..., legacy=True) to connect directly
+  self.ws.send(json.dumps(msg))
+extension loaded: id=kakpicabljpbdbhjokkldmlkdbgcehoj url=chrome-extension://kakpicabljpbdbhjokkldmlkdbgcehoj/sw.js
+parent page loaded
+enroll secret provisioned into extension storage: set
+parent chrome tab id=733861836 window id=733861834
+extension connected to relay: {'connected': True, 'url': 'ws://127.0.0.1:19822', 'error': '', 'startError': '8:25:34 PM Specified native messaging host not found.'}
+panel prompt pump running (auto-approves panel cards, logging each)
+share requested: {'ok': True, 'reqId': '90aeb166-4fde-41a6-b759-83a07d75c38c'}
+  [panel] APPROVED prompt: 'Give the chat you hand this code to full control of this tab?' -- 'On frame-a.test:8971, the chat you give this code to will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.' -> {'ok': True} (code at approval: None)
+pairing code obtained: U93YNJGA
+  client pair U93YNJGA --chat Frame Rig -> exit 0: {"ok": true, "chat": "Frame Rig", "sessionId": "9c52a6558abee4e2cb3565be", "tokenFile": "/tmp/frame-rig-jm0g5sgq/chat/.muse-bridge-token"}
+chat paired as None session 9c52a6558abee4e2cb3565be
+  one-card evidence: cards approved so far = 1; first card title = 'Give the chat you hand this code to full control of this tab?' with code at approval = None
+  => PASS generation-confirmation (exactly one card, at generation, before the code existed)
+  client tabs_context {} -> exit 0: {"ok": true, "data": {"chat": "Frame Rig", "tabs": [{"tabId": 733861836, "title": "Frame Rig Parent", "url": "http://frame-a.test:8971/parent.html", "active": true}], "permittedSites": ["frame-a.test:8971"], "orphans": []}, "pageContent": "untrusted"}
+harness reads the framed page via: oopif target
+iframe rect in parent viewport: {'x': 12, 'y': 236.875, 'w': 780, 'h': 470}
+
+CASE single-pill: one pill on the shared tab — idle, working, and settled
+  idle state: {'pills': 1, 'staticPills': 0, 'glow': False, 'stop': False}
+  screenshot saved: v2103-single-pill.png (shared tab, idle, single top pill)
+  working state: {'pills': 1, 'staticPills': 0, 'glow': True, 'stop': True}
+  screenshot saved: v2103-working.png (working layer up, still one pill)
+  client computer {"action": "wait", "tabId": 733861836, "duration": 8} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  settled state after the command: {'pills': 1, 'staticPills': 0, 'glow': False, 'stop': False}
+  idle one-pill/no-static: True; working glow+Stop with one pill: True; settled no static pill: True
+  => PASS single-pill
+
+CASE framed-contenteditable: click composer, type, click Send, read list back
+  composer viewport point: [402, 508]
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [402, 508]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "alpha-composer-123"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  frame truth after typing: {'messages': [], 'note': '', 'composer': 'alpha-composer-123'}
+  send button viewport point: [58, 644]
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [58, 644]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 733861836} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG: alpha-composer-123\nN
+  frame messages: ['alpha-composer-123']
+  in framed message list (ground truth): True; in bridge read-back of parent tab: True
+  => PASS framed-contenteditable
+
+CASE framed-textarea: click textarea, type, read value back
+  textarea viewport point: [235, 592]
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [235, 592]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "bravo-textarea-456"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 733861836} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG: alpha-composer-123\nN
+  frame textarea value (ground truth): 'bravo-textarea-456'
+  value exact match: True; in bridge read-back: True
+  => PASS framed-textarea
+
+CASE parent-control: click control textarea, type, click Post, read list back
+  control textarea viewport point: [225, 141]
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [225, 141]} -> exit 0: {"ok": true, "data": {"clicked": "textbox \"Control message\""}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "charlie-control-789"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [55, 186]} -> exit 0: {"ok": true, "data": {"clicked": "button \"Post control\""}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 733861836} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\ncharlie-control-789\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG: 
+  parent control list (ground truth): ['charlie-control-789']
+  in control list: True; in bridge read-back: True
+  => PASS parent-control
+
+CASE ref-cross-composer: find the cross-origin framed composer by label, click its ref, type, click the Send ref
+  client find {"tabId": 733861836, "query": "message composer"} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "matches": [{"ref": "ref_30", "role": "textbox", "name": "Message composer", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_14", "role": "StaticText", "name": "MESSAGES:\nMSG: alpha-composer-123\nNOTE: bravo-textarea-456\nCOMPOSER: "}, {"ref": 
+  client find {"tabId": 733861836, "query": "note textarea"} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "matches": [{"ref": "ref_14", "role": "StaticText", "name": "MESSAGES:\nMSG: alpha-composer-123\nNOTE: bravo-textarea-456\nCOMPOSER: "}, {"ref": "ref_31", "role": "textbox", "name": "Note", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_36", "r
+  client find {"tabId": 733861836, "query": "Send button"} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "matches": [{"ref": "ref_32", "role": "button", "name": "Send", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_37", "role": "button", "name": "Send", "frame": "http://frame-a.test:8971/chat.html"}, {"ref": "ref_41", "role": "button", "name": "S
+  cross-origin refs: composer=ref_30 note=ref_31 send=ref_32
+  client computer {"action": "left_click", "tabId": 733861836, "ref": "ref_30"} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "golf-refcross-333"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  frame truth after ref-click + type: {'messages': ['alpha-composer-123'], 'note': 'bravo-textarea-456', 'composer': 'golf-refcross-333'}
+  client computer {"action": "left_click", "tabId": 733861836, "ref": "ref_32"} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 733861836} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\ncharlie-control-789\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG: 
+  frame messages: ['alpha-composer-123', 'golf-refcross-333']
+  in framed message list (ground truth): True; in bridge read-back of parent tab: True
+  => PASS ref-cross-composer
+
+CASE ref-framed-textarea: form_input sets the cross-origin framed textarea by ref
+  client form_input {"tabId": 733861836, "ref": "ref_31", "value": "echo-forminput-111"} -> exit 0: {"ok": true, "data": {"set": "textbox \"Note\" (in a frame from frame-b.test:8972)"}, "pageContent": "untrusted"}
+  frame textarea value (ground truth): 'echo-forminput-111' (wanted 'echo-forminput-111')
+  => PASS ref-framed-textarea
+
+CASE ref-sameorigin-composer: the same ref flow inside the same-origin frame
+  client find {"tabId": 733861836, "query": "message composer"} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "matches": [{"ref": "ref_45", "role": "textbox", "name": "Message composer", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_42", "role": "StaticText", "name": "MESSAGES:\nMSG: alpha-composer-123\nMSG: golf-refcross-333\nNOTE: echo-forminput-111
+  client find {"tabId": 733861836, "query": "Send button"} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "matches": [{"ref": "ref_47", "role": "button", "name": "Send", "frame": "http://frame-b.test:8972/chat.html"}, {"ref": "ref_37", "role": "button", "name": "Send", "frame": "http://frame-a.test:8971/chat.html"}, {"ref": "ref_41", "role": "button", "name": "S
+  same-origin refs: composer=ref_35 send=ref_37
+  client computer {"action": "left_click", "tabId": 733861836, "ref": "ref_35"} -> exit 0: {"ok": true, "data": {"clicked": "div \"Message composer\" (in a frame from frame-a.test:8971)"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "delta-sameorigin-000"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  same-origin frame truth after ref-click + type: {'messages': [], 'note': '', 'composer': 'delta-sameorigin-000'}
+  client computer {"action": "left_click", "tabId": 733861836, "ref": "ref_37"} -> exit 0: {"ok": true, "data": {"clicked": "button \"Send\" (in a frame from frame-a.test:8971)"}, "pageContent": "untrusted"}
+  same-origin frame messages: ['delta-sameorigin-000']
+  => PASS ref-sameorigin-composer
+
+CASE framed-enter-submit: type into the keydown-submit composer, press Enter through the bridge
+  harness reads the key page via: oopif target
+  key iframe rect in parent viewport: {'x': 12, 'y': 101.5, 'w': 780, 'h': 470}
+  key composer viewport point: [402, 409]
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [402, 409]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "hotel-enter-444"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  key page truth after typing: {'messages': [], 'composer': 'hotel-enter-444', 'keydowns': 15, 'lastkey': '4 / Digit4'}
+  client computer {"action": "key", "tabId": 733861836, "text": "Enter"} -> exit 0: {"ok": true, "data": {"pressed": 1}, "pageContent": "untrusted"}
+  computer key Enter -> True
+  key page truth after Enter: {'messages': ['hotel-enter-444'], 'composer': '', 'keydowns': 16, 'lastkey': 'Enter / Enter'}
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [402, 409]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "india-sendbtn-555"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [58, 464]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  key page truth after Send click: {'messages': ['hotel-enter-444', 'india-sendbtn-555'], 'composer': '', 'keydowns': 33, 'lastkey': '5 / Digit5'}
+  typed without submitting: True; Enter submitted with a real Enter keydown seen by the frame: True; Send button click submitted: True
+  => PASS framed-enter-submit
+
+CASE background-framed-composer: decoy tab in front, drive the shared (background) tab
+  decoy tab activated; the shared tab is now in the background
+  iframe rect re-measured for the background case: {'x': 12, 'y': 270.875, 'w': 780, 'h': 470}
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [402, 542]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "foxtrot-background-222"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  frame truth after typing: {'messages': ['alpha-composer-123', 'golf-refcross-333'], 'note': 'echo-forminput-111', 'composer': 'foxtrot-background-222'}
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [58, 678]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client get_page_text {"tabId": 733861836} -> exit 0: {"ok": true, "data": {"tabId": 733861836, "url": "http://frame-a.test:8971/parent.html", "title": "Frame Rig Parent", "text": "Parent page (origin A)\nControl message\n\nPost control\ncharlie-control-789\nCross-origin framed chat state, as reported by the frame itself (postMessage)\nMESSAGES:\nMSG: 
+  frame messages: ['alpha-composer-123', 'golf-refcross-333', 'foxtrot-background-222']
+  in framed message list (ground truth): True; in bridge read-back of parent tab: True
+  => PASS background-framed-composer
+
+CASE check-connection: the panel probe runs every step for this tab
+  step PASS Relay reachable -- ws://127.0.0.1:19822 — connected
+  step PASS Session still valid at the relay -- session for “Frame Rig” is live at the relay
+  step PASS Tab in the chat's tab group -- group “Muse · Frame Rig”
+  step PASS Control round-trip -- tabs_context through the session read this tab and its current title
+  => PASS check-connection
+
+CASE debug-report: contents complete, and free of secrets
+  report has version/chat/host/check/events: True; leaks token or enroll secret: []
+  => PASS debug-report
+
+CASE refresh-live: Refresh on the shared tab, redeem with the live token, control unchanged
+  [panel] APPROVED prompt: 'Give the chat you hand this code to full control of this tab?' -- 'On frame-a.test:8971, the chat you give this code to will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.' -> {'ok': True} (code at approval: None)
+  refresh code obtained: N59RMNPH
+  client pair N59RMNPH --chat Frame Rig -> exit 0: {"ok": true, "attached": true, "chat": "Frame Rig", "sessionId": "9c52a6558abee4e2cb3565be", "tokenFile": "/tmp/frame-rig-jm0g5sgq/chat/.muse-bridge-token"}
+  pair with live token -> attached: True; token file unchanged: True
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [402, 542]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "juliett-refresh-666"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [58, 678]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  control after refresh (typed + sent in the framed composer): True; messages: ['alpha-composer-123', 'golf-refcross-333', 'foxtrot-background-222', 'juliett-refresh-666']
+  => PASS refresh-live
+
+CASE refresh-dead-token: a chat with a dead token is revived by a Refresh code
+  client status -> exit 1: {"ok": false, "error": "bad_token"}
+  dead token status -> 'bad_token' (bad_token expected): True
+  [panel] APPROVED prompt: 'Give the chat you hand this code to full control of this tab?' -- 'On frame-a.test:8971, the chat you give this code to will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.' -> {'ok': True} (code at approval: None)
+  client pair SQQDNV7W --chat Frame Rig B -> exit 0: {"ok": true, "chat": "Frame Rig B", "sessionId": "4b9da5c5ef815aefaa5381cc", "tokenFile": "/tmp/frame-rig-jm0g5sgq/chat2/.muse-bridge-token"}
+  pair with the refresh code -> ok: True; dead token replaced in the file: True
+  client tabs_context {} -> exit 0: {"ok": true, "data": {"chat": "Frame Rig B", "tabs": [{"tabId": 733861836, "title": "Frame Rig Parent", "url": "http://frame-a.test:8971/parent.html", "active": true}], "permittedSites": ["frame-a.test:8971"], "orphans": []}, "pageContent": "untrusted"}
+  client tabs_context {} -> exit 1: {"ok": false, "error": "bad_token", "pageContent": "untrusted", "detail": "this chat is no longer connected \u2014 its token is dead. Ask the user to open the tab in the Muse Bridge panel and click Refresh connection (or Generate a code if the tab shows Not shared), then pair with the new code they 
+  revived chat sees the tab: True; the old chat no longer holds it: True
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [402, 542]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  client computer {"action": "type", "tabId": 733861836, "text": "kilo-revived-777"} -> exit 0: {"ok": true, "data": {}, "pageContent": "untrusted"}
+  client computer {"action": "left_click", "tabId": 733861836, "coordinate": [58, 678]} -> exit 0: {"ok": true, "data": {"clicked": "a frame from frame-b.test:8972"}, "pageContent": "untrusted"}
+  revived chat drove the framed composer (typed + sent): True; messages: ['alpha-composer-123', 'golf-refcross-333', 'foxtrot-background-222', 'juliett-refresh-666', 'kilo-revived-777']
+  => PASS refresh-dead-token
+
+CASE check-connection-relay-down: forced failure reports real results
+  step FAIL Relay reachable -- the extension is not connected to the relay
+  step FAIL Session still valid at the relay -- not checked — the relay is unreachable
+  step FAIL Tab in the chat's tab group -- not checked — the relay is unreachable
+  step FAIL Control round-trip -- not checked — the relay is unreachable
+  => PASS check-connection-relay-down
+panel prompts approved during the run: 3
+  approved: 'Give the chat you hand this code to full control of this tab?' -- 'On frame-a.test:8971, the chat you give this code to will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.'
+  approved: 'Give the chat you hand this code to full control of this tab?' -- 'On frame-a.test:8971, the chat you give this code to will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.'
+  approved: 'Give the chat you hand this code to full control of this tab?' -- 'On frame-a.test:8971, the chat you give this code to will be able to click, type (password fields included), press Enter, send and submit, take actions that may pay, order or delete, upload files, and open other sites in this tab — with no more questions in this tab. This lasts while the tab is shared; you can stop sharing at any time.'
+
+==== SUMMARY ====
+PASS generation-confirmation
+PASS single-pill
+PASS framed-contenteditable
+PASS framed-textarea
+PASS parent-control
+PASS ref-cross-composer
+PASS ref-framed-textarea
+PASS ref-sameorigin-composer
+PASS framed-enter-submit
+PASS background-framed-composer
+PASS check-connection
+PASS debug-report
+PASS refresh-live
+PASS refresh-dead-token
+PASS check-connection-relay-down

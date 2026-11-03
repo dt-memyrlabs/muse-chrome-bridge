@@ -160,7 +160,7 @@ async function runCheck(tabId, live) {
     check: okRes.steps });
   const text = (rep && rep.text) || "";
   check("debug report builds", rep.ok && text.length > 100, rep);
-  for (const want of ["2.10.2", "Chrome/130.0.0.0", "Chat A", "shop.example.com",
+  for (const want of ["2.10.3", "Chrome/130.0.0.0", "Chat A", "shop.example.com",
                       "PASS Relay reachable", "Recent activity", "paired"])
     check("report contains: " + want, text.includes(want), text.slice(0, 400));
   for (const banned of ["CODENEVER", "TESTENROLLSECRET", "Distinctive Shop Title ZQX-9911", A.sid])

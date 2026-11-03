@@ -3,6 +3,28 @@
 Release notes for every shipped version, newest first. The same text
 ships on each GitHub release page.
 
+## v2.10.3 — one pill only (2026-11-03)
+
+Daniel's order: a shared tab showed TWO pill boxes. Now it shows one.
+
+- **The second pill is gone.** The agent layer (agent-ui.js, the v2.8
+  parity layer) drew a static pill at the bottom-left of a chat's
+  tabs — "Muse is active in this tab group", with Open chat and
+  Dismiss buttons, kept alive by a 5 s heartbeat. The pill, its
+  buttons and the heartbeat are removed, and so is the worker-side
+  machinery that drove them: the `static` state in every agent-ui
+  command, the dismissal store, and the agent_heartbeat /
+  agent_open_chat / agent_dismiss_static messages. A stray `static`
+  field in a command is ignored on the page side, so the pill cannot
+  come back.
+- **What stays is the one real pill** — pill.js's
+  "● Muse · <chat name> ✕" at the top of the tab, draggable, with
+  its position remembered — and, while a command runs, the agent
+  layer's pulsing glow border and "Stop Muse" button. The layer
+  still hides for every capture. Nothing else changed: pairing, the
+  generation confirmation, the Connection area and the panel are
+  exactly as v2.10.2 shipped them.
+
 ## v2.10.2 — panel results that match the state they're in (2026-11-02)
 
 Five panel fixes from the v2.10.1 review gate. Panel-side only: no

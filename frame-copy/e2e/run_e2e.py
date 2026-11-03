@@ -35,6 +35,7 @@ Exit code: 0 = every case passed, 1 = at least one case failed,
 2 = the rig itself could not be set up.
 """
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -558,6 +559,74 @@ def main():
             rc_, out_ = client(chatdir, "get_page_text", json.dumps({"tabId": tab_id}))
             return (out_.get("data") or {}).get("text", "") if out_.get("ok") else ""
 
+        # ==== CASE: exactly ONE pill on a shared tab (v2.10.3) ============
+        # Daniel's order: one pill only. pill.js draws the draggable
+        # <muse-bridge-pill> at the top; agent-ui.js used to draw a
+        # SECOND, static pill at the bottom-left ("Muse is active in
+        # this tab group"). v2.10.3 removes it. Ground truth is the
+        # page DOM itself: count pill hosts, scan for the static
+        # pill's text, and — while a command runs — confirm the glow
+        # border and the Stop button still show with no second pill,
+        # in the working state AND in the settled state after the
+        # command ends (the settled state is where the static pill
+        # used to appear on the worked tab).
+        log("\nCASE single-pill: one pill on the shared tab — idle, working, and settled")
+        PILL_PROBE = (
+            "JSON.stringify({"
+            " pills: document.querySelectorAll('muse-bridge-pill').length,"
+            " staticPills: [...document.querySelectorAll('div')]"
+            "   .filter(d => (d.textContent || '').includes('Muse is active in this tab group')).length,"
+            " glow: [...document.querySelectorAll('div')].some(d => {"
+            "   const cs = getComputedStyle(d);"
+            "   return cs.animationName === 'muse-agent-pulse' && cs.display !== 'none'"
+            "     && d.getBoundingClientRect().width > 0; }),"
+            " stop: [...document.querySelectorAll('button')].some(b =>"
+            "   (b.textContent || '').includes('Stop Muse') && b.getClientRects().length > 0)"
+            " })")
+
+        def pill_state():
+            return json.loads(cdp.evaluate(parent, f"(() => {PILL_PROBE})()"))
+
+        def shot_parent(fname):
+            data = cdp.call("Page.captureScreenshot", {"format": "png"}, parent)["data"]
+            with open(os.path.join(HERE, fname), "wb") as f:
+                f.write(base64.b64decode(data))
+
+        idle = wait_for(lambda: (lambda s: s if s["pills"] == 1 else None)(pill_state()),
+                        20, "the pill.js pill on the shared tab")
+        log(f"  idle state: {idle}")
+        idle_ok = idle["pills"] == 1 and idle["staticPills"] == 0
+        shot_parent("v2103-single-pill.png")
+        log("  screenshot saved: v2103-single-pill.png (shared tab, idle, single top pill)")
+
+        wait_box = {}
+
+        def run_wait():
+            wait_box["r"] = client(chatdir, "computer", json.dumps(
+                {"action": "wait", "tabId": tab_id, "duration": 8}))
+
+        wt = threading.Thread(target=run_wait, daemon=True)
+        wt.start()
+        try:
+            working = wait_for(lambda: (lambda s: s if s["glow"] and s["stop"] else None)(pill_state()),
+                               15, "the working layer (glow + Stop) during the wait command")
+        except TimeoutError:
+            working = pill_state()
+        log(f"  working state: {working}")
+        working_ok = bool(working["glow"] and working["stop"]
+                          and working["pills"] == 1 and working["staticPills"] == 0)
+        if working_ok:
+            shot_parent("v2103-working.png")
+            log("  screenshot saved: v2103-working.png (working layer up, still one pill)")
+        wt.join(timeout=30)
+        time.sleep(1.2)
+        settled = pill_state()
+        log(f"  settled state after the command: {settled}")
+        settled_ok = settled["pills"] == 1 and settled["staticPills"] == 0
+        results["single-pill"] = bool(idle_ok and working_ok and settled_ok)
+        log(f"  idle one-pill/no-static: {idle_ok}; working glow+Stop with one pill: {working_ok}; settled no static pill: {settled_ok}")
+        log(f"  => {'PASS' if results['single-pill'] else 'FAIL'} single-pill")
+
         # ==== CASE 1: framed contenteditable composer -> Send -> list ======
         log("\nCASE framed-contenteditable: click composer, type, click Send, read list back")
         pt = framed_point("composer")
@@ -833,7 +902,7 @@ def main():
         tok_val = open(tok_path).read().strip() if os.path.isfile(tok_path) else ""
         r = panel.send("debug_report", {"tabId": tab_id, "ua": "rig-check", "check": steps})
         text = (r or {}).get("text") or ""
-        has_bits = all(x in text for x in ("2.10.2", "Frame Rig", "frame-a.test", "PASS Relay reachable", "Recent activity"))
+        has_bits = all(x in text for x in ("2.10.3", "Frame Rig", "frame-a.test", "PASS Relay reachable", "Recent activity"))
         leaks = [x for x in (tok_val, SECRET) if x and x in text]
         results["debug-report"] = bool(r and r.get("ok") and has_bits and not leaks)
         log(f"  report has version/chat/host/check/events: {has_bits}; leaks token or enroll secret: {leaks}")
@@ -972,7 +1041,7 @@ def main():
                 f"{want} generation(s) started, codes at approval: {[p.get('_codeAtApproval') for p in pump.approved]}")
 
     log("\n==== SUMMARY ====")
-    for name in ("generation-confirmation", "framed-contenteditable", "framed-textarea", "parent-control",
+    for name in ("generation-confirmation", "single-pill", "framed-contenteditable", "framed-textarea", "parent-control",
                  "ref-cross-composer", "ref-framed-textarea", "ref-sameorigin-composer",
                  "framed-enter-submit", "background-framed-composer",
                  "check-connection", "debug-report", "refresh-live", "refresh-dead-token",
