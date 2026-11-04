@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Muse Chrome Bridge",
-  "version": "2.10.4",
+  "version": "2.10.5",
   "description": "Give tabs to a Muse chat. One confirmation gives that chat full control of the tabs you give it \u2014 and only those tabs.",
   "background": {
     "service_worker": "sw.js"

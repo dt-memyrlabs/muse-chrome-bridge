@@ -318,6 +318,10 @@ def main(argv):
         return 2
     cmd, rest = argv[0], argv[1:]
 
+    if cmd == "connect":
+        return out({"ok": False, "error": "use_pair",
+                    "detail": "connect was replaced by code-first pairing. Ask the user to open the Muse Bridge panel, click 'Generate a code', and paste the 8-character code, then run: pair <CODE> --chat \"<your chat name>\""}, 2)
+
     if cmd == "pair":
         if not rest:
             return out({"ok": False, "error": "bad_usage", "detail": "pair <CODE> --chat <name>"}, 2)

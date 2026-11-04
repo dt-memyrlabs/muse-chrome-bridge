@@ -22,7 +22,7 @@
 importScripts("policy.js");
 const P = self.MBB;
 
-const VERSION = "2.10.4";
+const VERSION = "2.10.5";
 const DEFAULT_RELAY = "ws://127.0.0.1:19822";
 const APPROVAL_MS = 60000;      // longest a prompt waits
 const MIN_ASK_MS = 5000;        // don't open a prompt with less time than this left
@@ -3338,7 +3338,8 @@ TOOLS.get_page_text = async (ctx, a) => {
 
 TOOLS.get_form_values = async (ctx, a) => {
   const tab = await resolveTab(ctx, a.tabId);
-  const raw = await probe(tab, P.hostOf(tab.url), "fields");
+  const host = P.hostOf(tab.url);
+  const raw = await probe(tab, host, "fields");
   // Second filter at the tool boundary: the probe masks these fields, but
   // a hidden, payment or OTP value that still arrives here never leaves.
   // Only name and type are available at this layer, so the name check is
@@ -4139,12 +4140,22 @@ TOOLS.upload_image = async (ctx, a) => {
   } else if (a.imageBase64) { bytes = String(a.imageBase64); if (a.mimeType) mime = String(a.mimeType); }
   if (!bytes) throw fail("no_image", "give imageId (a screenshot from this chat), imageBase64, or filePath");
   let x, y;
-  if (Array.isArray(a.coordinate)) { [x, y] = a.coordinate.map(Number); }
-  else if (a.ref != null) {
+  if (Array.isArray(a.coordinate)) {
+    [x, y] = a.coordinate.map(Number);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw fail("bad_coordinate");
+    ({ x, y } = await smoothShowPoint(tab, x, y));
+  } else if (a.ref != null) {
     const hitU = refHit(a.ref);
-    if (typeof hitU.x !== "number" || typeof hitU.y !== "number")
-      throw fail("no_target", "that ref carries no point to drop on — pass a coordinate");
-    x = hitU.x; y = hitU.y;
+    if (hitU.framed) {
+      const p = await framedPoint(tab, hitU).catch((e) => { if (e && e.code) throw e; return null; });
+      if (!p) throw fail("not_visible", "that element is inside a frame and its position could not be measured; read_page again");
+      x = p.x; y = p.y;
+    } else {
+      const backend = await nodeForRef(tab, a.ref);
+      const c = await smoothShowNode(tab, backend).catch(() => null);
+      if (c) { x = c.x; y = c.y; }
+      else ({ x, y } = await pointForNode(tab.id, backend));
+    }
   } else throw fail("no_target", "give a ref or a coordinate to drop the image on");
   await attach(tab.id);
   await ensureFocusEmulation(tab.id).catch(() => {});

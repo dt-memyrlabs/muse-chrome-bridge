@@ -941,7 +941,7 @@ def main():
         tok_val = open(tok_path).read().strip() if os.path.isfile(tok_path) else ""
         r = panel.send("debug_report", {"tabId": tab_id, "ua": "rig-check", "check": steps})
         text = (r or {}).get("text") or ""
-        has_bits = all(x in text for x in ("2.10.4", "Frame Rig", "frame-a.test", "PASS Relay reachable", "Recent activity"))
+        has_bits = all(x in text for x in ("2.10.5", "Frame Rig", "frame-a.test", "PASS Relay reachable", "Recent activity"))
         leaks = [x for x in (tok_val, SECRET) if x and x in text]
         results["debug-report"] = bool(r and r.get("ok") and has_bits and not leaks)
         log(f"  report has version/chat/host/check/events: {has_bits}; leaks token or enroll secret: {leaks}")

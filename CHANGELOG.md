@@ -3,6 +3,50 @@
 Release notes for every shipped version, newest first. The same text
 ships on each GitHub release page.
 
+## v2.10.5 — Antigravity's audit fixes (2026-11-04)
+
+Four fixes from an audit Antigravity ran on the PC copy of v2.10.4,
+working with Daniel. Each one was checked against the shipped tree
+before it was ported in; nothing else changed.
+
+- **`get_form_values` crashed on every call.** The tool passed
+  `P.hostOf(tab.url)` inline to the page probe and then used a
+  `host` variable that was never defined in the audit line, so every
+  call threw `ReferenceError: host is not defined`. (This is the
+  undefined-host defect 8090 flagged in its source review.) `host`
+  is now bound at the top of the tool.
+- **`upload_image` could never drop onto an element ref.** The drop
+  path read `x`/`y` straight off the ref record, which never carries
+  them, so every ref drop answered `no_target`. A ref now resolves
+  the same way the pointer actions do: `framedPoint` for framed
+  refs, `nodeForRef` + `smoothShowNode` / `pointForNode` for
+  top-frame refs; bare coordinates still go through
+  `smoothShowPoint` and are checked finite. The file-path route and
+  its credential-store refusal are untouched and still fire first.
+- **`client.py connect` failed with a confusing error.** `connect`
+  and `/announce` were removed in the code-first pairing model, but
+  the command still fell through to tool invocation and answered
+  `not_paired` / `unknown_action`. It now answers
+  `{"error": "use_pair"}` with the pair instructions and exits 2.
+  `SKILL.md`'s Connecting section leads with `pair`, and two stale
+  `connect` mentions later in the file (the token paragraph and the
+  `waiting` error-table row) now match the pair flow too.
+- **The relay flooded its error log when a client hung up early.**
+  When a client closed its HTTP socket mid-answer, writing the
+  response threw `ConnectionResetError` inside the `/cmd` handler,
+  whose error path tried to write a second response on the dead
+  socket — chained tracebacks by the thousand. `_json` now ignores
+  `BrokenPipeError` / `ConnectionResetError` /
+  `ConnectionAbortedError`, and the `/cmd` handler takes the
+  command result first and writes the response outside the try.
+
+Proven the same way as v2.10.4: all 19 extension JS suites and the
+Python suites pass (relay 53/59 is the standing baseline — the same
+6 VM-route failures), and the real-Chromium rig passes 16/16,
+including the generation-confirmation, single-pill, framed-composer
+and refresh cases. Dropping an image by ref is covered by the
+tools2 suite; it is not exercised end-to-end in the rig.
+
 ## v2.10.4 — the chat box is findable (2026-11-03)
 
 A chat told Daniel it could not find the chat box to type in. The
